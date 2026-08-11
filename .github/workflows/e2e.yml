@@ -36,6 +36,7 @@ concurrency:
 env:
   LEGACY_UPSTREAM_REF: 'workflow@4.1.0-beta.54'
   TURSO_UPSTREAM_REF: ${{ inputs.upstream-ref || 'workflow@5.0.0-beta.40' }}
+  UPSTREAM_RUST_TOOLCHAIN: '1.95.0'
   APP_NAME: nextjs-turbopack
 
 jobs:
@@ -60,6 +61,11 @@ jobs:
         with:
           node-version: '22'
           cache: 'pnpm'
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.UPSTREAM_RUST_TOOLCHAIN }}
+          target: wasm32-unknown-unknown
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -146,6 +152,11 @@ jobs:
         with:
           node-version: '22'
           cache: 'pnpm'
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.UPSTREAM_RUST_TOOLCHAIN }}
+          target: wasm32-unknown-unknown
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @workflow-worlds/turso build
