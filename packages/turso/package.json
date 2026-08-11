@@ -35,6 +35,7 @@
   },
   "scripts": {
     "build": "tsc && chmod +x bin/setup.js",
+    "prepare": "pnpm build",
     "dev": "tsc --watch",
     "test": "pnpm --filter @workflow-worlds/testing build && pnpm build && vitest run",
     "test:only": "pnpm --filter @workflow-worlds/testing build && vitest run",
