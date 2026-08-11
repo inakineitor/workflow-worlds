@@ -94,6 +94,7 @@ export function createQueue(config: QueueConfig): TursoQueue {
   let closing = false;
   let pollPromise: Promise<void> | undefined;
   let pollController: AbortController | undefined;
+  let startPromise: Promise<void> | undefined;
   let resolvedBaseUrl: Promise<string> | undefined;
 
   async function getExecutionBaseUrl(): Promise<string> {
@@ -127,11 +128,12 @@ export function createQueue(config: QueueConfig): TursoQueue {
     const nowString = now.toISOString();
     const leaseUntil = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
     const lockToken = `lock_${generateUlid()}`;
-    const transaction = await client.transaction('write');
-
-    try {
-      const result = await transaction.execute({
-        sql: `SELECT message_id, queue_name, payload, headers, attempt
+    const result = await client.execute({
+      sql: `UPDATE queue_messages
+            SET status = 'processing', lock_token = ?, lease_until = ?,
+                updated_at = ?
+            WHERE message_id = (
+              SELECT message_id
               FROM queue_messages
               WHERE (
                 status = 'pending'
@@ -139,42 +141,35 @@ export function createQueue(config: QueueConfig): TursoQueue {
               )
               AND (not_before IS NULL OR not_before <= ?)
               ORDER BY created_at ASC
-              LIMIT 1`,
-        args: [nowString, nowString],
-      });
-      const row = result.rows[0];
-      if (!row) {
-        await transaction.commit();
-        return undefined;
-      }
-
-      const messageId = MessageId.parse(row.message_id);
-      const update = await transaction.execute({
-        sql: `UPDATE queue_messages
-              SET status = 'processing', lock_token = ?, lease_until = ?,
-                  updated_at = ?
-              WHERE message_id = ?
-                AND (status = 'pending' OR lease_until <= ?)`,
-        args: [lockToken, leaseUntil, nowString, messageId, nowString],
-      });
-      if (update.rowsAffected !== 1) {
-        await transaction.commit();
-        return undefined;
-      }
-
-      await transaction.commit();
-      return {
-        messageId,
-        queueName: row.queue_name as ValidQueueName,
-        payload: String(row.payload),
-        headers: deserializeHeaders(row.headers),
-        attempt: Math.max(1, Number(row.attempt) || 1),
+              LIMIT 1
+            )
+            AND (
+              status = 'pending'
+              OR (status = 'processing' AND lease_until <= ?)
+            )
+            RETURNING message_id, queue_name, payload, headers, attempt`,
+      args: [
         lockToken,
-      };
-    } catch (error) {
-      transaction.close();
-      throw error;
+        leaseUntil,
+        nowString,
+        nowString,
+        nowString,
+        nowString,
+      ],
+    });
+    const row = result.rows[0];
+    if (!row) {
+      return undefined;
     }
+
+    return {
+      messageId: MessageId.parse(row.message_id),
+      queueName: row.queue_name as ValidQueueName,
+      payload: String(row.payload),
+      headers: deserializeHeaders(row.headers),
+      attempt: Math.max(1, Number(row.attempt) || 1),
+      lockToken,
+    };
   }
 
   async function updateClaim(
@@ -309,6 +304,20 @@ export function createQueue(config: QueueConfig): TursoQueue {
     }
   }
 
+  async function startPolling(): Promise<void> {
+    if (running) {
+      return;
+    }
+    startPromise ??= (async () => {
+      await client.execute('PRAGMA busy_timeout = 5000');
+      closing = false;
+      running = true;
+      pollController = new AbortController();
+      pollPromise = poll();
+    })();
+    await startPromise;
+  }
+
   const queue: Queue['queue'] = async (queueName, message, options) => {
     parseQueueName(queueName);
     const messageId = MessageId.parse(`msg_${generateUlid()}`);
@@ -348,11 +357,13 @@ export function createQueue(config: QueueConfig): TursoQueue {
       });
       const existingId = existing.rows[0]?.message_id;
       if (existingId) {
+        await startPolling();
         return { messageId: MessageId.parse(existingId) };
       }
       throw error;
     }
 
+    await startPolling();
     return { messageId };
   };
 
@@ -411,15 +422,7 @@ export function createQueue(config: QueueConfig): TursoQueue {
     getDeploymentId: async () => process.env.DEPLOYMENT_ID ?? 'dpl_turso',
     queue,
     createQueueHandler,
-    async start() {
-      if (running) {
-        return;
-      }
-      closing = false;
-      running = true;
-      pollController = new AbortController();
-      pollPromise = poll();
-    },
+    start: startPolling,
     async close() {
       if (!running) {
         return;
@@ -432,6 +435,7 @@ export function createQueue(config: QueueConfig): TursoQueue {
       inFlight.clear();
       pollController = undefined;
       pollPromise = undefined;
+      startPromise = undefined;
     },
   };
 }

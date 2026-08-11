@@ -38,6 +38,62 @@ describe('persistent queue', () => {
     await client.close();
   });
 
+  it('starts polling when the first message is queued', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'workflow-turso-lazy-start-'));
+    directories.push(directory);
+    const databaseUrl = `file:${join(directory, 'workflow.db')}`;
+    await migrateDatabase({ databaseUrl });
+    const client = createClient({ url: databaseUrl });
+    const received = vi.fn();
+    const server = createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      request.on('end', () => {
+        received(JSON.parse(Buffer.concat(chunks).toString()));
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ ok: true }));
+      });
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve)
+    );
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      throw new Error('Expected an HTTP server port');
+    }
+    const queue = createQueue({
+      client,
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      pollIntervalMs: 10,
+    });
+
+    try {
+      await queue.queue('__wkf_workflow_lazy-start', {
+        runId: 'wrun_lazy-start',
+      });
+      await Promise.all(
+        Array.from({ length: 10 }, (_, index) =>
+          queue.queue('__wkf_workflow_lazy-start', {
+            runId: `wrun_concurrent-${index}`,
+          })
+        )
+      );
+      await vi.waitFor(
+        () => {
+          expect(received).toHaveBeenCalledWith({ runId: 'wrun_lazy-start' });
+          expect(received).toHaveBeenCalledTimes(11);
+        },
+        { timeout: 5_000, interval: 20 }
+      );
+    } finally {
+      await queue.close();
+      await client.close();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve()))
+      );
+    }
+  });
+
   it('redelivers a message whose processing lease expired', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'workflow-turso-queue-'));
     directories.push(directory);

@@ -127,4 +127,51 @@ describe('Workflow v5 storage', () => {
     );
     expect(event.runId).toBe('wrun_01KZCORRELATION00000000000a');
   });
+
+  it('returns the last event cursor when a page has no more results', async () => {
+    const { storage } = await createStorage();
+    const runId = 'wrun_01KZEVENTCURSOR000000000001';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      specVersion: 5,
+      eventData: {
+        deploymentId: 'deployment-v5',
+        workflowName: 'workflow//test//cursor',
+        input: new Uint8Array(),
+      },
+    });
+    await storage.events.create(runId, {
+      eventType: 'attr_set',
+      specVersion: 5,
+      correlationId: 'attr-cursor',
+      eventData: {
+        changes: [{ key: 'phase', value: 'first' }],
+        writer: { type: 'workflow' },
+      },
+    });
+
+    const initial = await storage.events.list({
+      runId,
+      pagination: { limit: 10 },
+    });
+    expect(initial).toMatchObject({ hasMore: false });
+    expect(initial.cursor).toBe(initial.data.at(-1)?.eventId);
+
+    await storage.events.create(runId, {
+      eventType: 'attr_set',
+      specVersion: 5,
+      correlationId: 'attr-cursor-next',
+      eventData: {
+        changes: [{ key: 'phase', value: 'second' }],
+        writer: { type: 'workflow' },
+      },
+    });
+    const incremental = await storage.events.list({
+      runId,
+      pagination: { limit: 10, cursor: initial.cursor ?? undefined },
+    });
+    expect(incremental.data).toHaveLength(1);
+    expect(incremental.cursor).toBe(incremental.data[0].eventId);
+    expect(incremental.hasMore).toBe(false);
+  });
 });

@@ -59,4 +59,31 @@ describe('Workflow v5 streams', () => {
       await readAll(await streamer.streams.get('run-stream-negative', 'output', -2))
     ).toBe('twothree');
   });
+
+  it('atomically allocates indexes across concurrent batch writes', async () => {
+    const { streamer } = await createStreamer();
+    const batches = Array.from({ length: 4 }, (_, batch) =>
+      Array.from({ length: 3 }, (_, chunk) => `${batch}-${chunk}`)
+    );
+
+    await Promise.all(
+      batches.map((chunks) =>
+        streamer.streams.writeMulti?.('run-stream-concurrent', 'output', chunks)
+      )
+    );
+    await streamer.streams.close('run-stream-concurrent', 'output');
+
+    const result = await streamer.streams.getChunks(
+      'run-stream-concurrent',
+      'output',
+      { limit: 20 }
+    );
+    expect(result.data.map(({ index }) => index)).toEqual(
+      Array.from({ length: 12 }, (_, index) => index)
+    );
+    expect(
+      result.data.map(({ data }) => new TextDecoder().decode(data)).sort()
+    ).toEqual(batches.flat().sort());
+    expect(result).toMatchObject({ cursor: null, hasMore: false, done: true });
+  });
 });

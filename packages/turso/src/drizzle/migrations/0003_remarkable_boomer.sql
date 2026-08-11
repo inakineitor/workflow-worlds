@@ -83,4 +83,15 @@ SELECT
   sc.`created_at`
 FROM `stream_runs` sr
 JOIN `stream_chunks` sc ON sc.`stream_name` = sr.`stream_name`
-WHERE COALESCE(sc.`is_eof`, 0) = 0;
+WHERE COALESCE(sc.`is_eof`, 0) = 0;--> statement-breakpoint
+CREATE TRIGGER `workflow_stream_chunks_advance_tail`
+AFTER INSERT ON `workflow_stream_chunks`
+BEGIN
+	UPDATE `workflow_streams`
+	SET
+		`tail_index` = MAX(`tail_index`, NEW.`chunk_index`),
+		`updated_at` = NEW.`created_at`
+	WHERE
+		`run_id` = NEW.`run_id`
+		AND `stream_name` = NEW.`stream_name`;
+END;

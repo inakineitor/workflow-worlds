@@ -657,7 +657,7 @@ export function createStorage(config: StorageConfig): Storage {
         const hasMore = result.length > limit;
         const rows = result.slice(0, limit);
         const data = rows.map((row) => toEvent(row));
-        const nextCursor = hasMore ? data[data.length - 1]?.eventId : null;
+        const nextCursor = data.at(-1)?.eventId ?? null;
 
         return {
           data: data.map((e) => filterEventData(e, params.resolveData)),
@@ -697,7 +697,7 @@ export function createStorage(config: StorageConfig): Storage {
         const hasMore = result.length > limit;
         const rows = result.slice(0, limit);
         const data = rows.map((row) => toEvent(row));
-        const nextCursor = hasMore ? data[data.length - 1]?.eventId : null;
+        const nextCursor = data.at(-1)?.eventId ?? null;
 
         return {
           data: data.map((e) => filterEventData(e, params.resolveData)),

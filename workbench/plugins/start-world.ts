@@ -33,7 +33,7 @@ export default defineNitroPlugin(async () => {
     debug(`Starting World: ${targetWorld}...`);
     try {
       const { getWorld } = await import('workflow/runtime');
-      const world = getWorld();
+      const world = await getWorld();
       if (world.start) {
         await world.start();
         debug(`World ${targetWorld} started successfully`);

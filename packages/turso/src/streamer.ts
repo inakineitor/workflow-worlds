@@ -74,48 +74,33 @@ export function createStreamer(config: StreamerConfig): TursoStreamer {
       return;
     }
 
-    const transaction = await client.transaction('write');
-    try {
-      const now = new Date().toISOString();
-      await transaction.execute({
-        sql: `INSERT OR IGNORE INTO workflow_streams
-              (run_id, stream_name, tail_index, done, created_at, updated_at)
-              VALUES (?, ?, -1, 0, ?, ?)`,
-        args: [runId, name, now, now],
-      });
-      const stream = await transaction.execute({
-        sql: `SELECT tail_index, done FROM workflow_streams
-              WHERE run_id = ? AND stream_name = ?`,
-        args: [runId, name],
-      });
-      const row = stream.rows[0];
-      if (!row) {
-        throw new Error(`Unable to initialize stream ${name}`);
-      }
-      if (Number(row.done) === 1) {
-        throw new Error(`Cannot write to closed stream ${name}`);
-      }
+    await ensureStream(runId, name);
 
-      let nextIndex = Number(row.tail_index) + 1;
-      for (const chunk of chunks) {
-        await transaction.execute({
-          sql: `INSERT INTO workflow_stream_chunks
-                (run_id, stream_name, chunk_index, data, created_at)
-                VALUES (?, ?, ?, ?, ?)`,
-          args: [runId, name, nextIndex, encodeChunk(chunk) as InValue, now],
-        });
-        nextIndex += 1;
-      }
-      await transaction.execute({
-        sql: `UPDATE workflow_streams
-              SET tail_index = ?, updated_at = ?
-              WHERE run_id = ? AND stream_name = ?`,
-        args: [nextIndex - 1, now, runId, name],
-      });
-      await transaction.commit();
-    } catch (error) {
-      transaction.close();
-      throw error;
+    const values = chunks.map(() => '(?, ?)').join(', ');
+    const valueArgs = chunks.flatMap((chunk, offset) => [
+      offset,
+      encodeChunk(chunk) as InValue,
+    ]);
+    const now = new Date().toISOString();
+    const result = await client.execute({
+      sql: `WITH stream AS MATERIALIZED (
+              SELECT tail_index + 1 AS start_index
+              FROM workflow_streams
+              WHERE run_id = ? AND stream_name = ? AND done = 0
+            ), chunks(chunk_offset, data) AS (
+              VALUES ${values}
+            )
+            INSERT INTO workflow_stream_chunks
+              (run_id, stream_name, chunk_index, data, created_at)
+            SELECT ?, ?, stream.start_index + chunks.chunk_offset,
+              chunks.data, ?
+            FROM stream CROSS JOIN chunks
+            RETURNING chunk_index`,
+      args: [runId, name, ...valueArgs, runId, name, now],
+    });
+
+    if (result.rows.length !== chunks.length) {
+      throw new Error(`Cannot write to closed stream ${name}`);
     }
   }
 
