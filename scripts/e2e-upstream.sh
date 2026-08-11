@@ -17,7 +17,7 @@ set -euo pipefail
 #
 # Environment:
 #   E2E_UPSTREAM_DIR    Override upstream clone location (default: .e2e-upstream)
-#   E2E_UPSTREAM_REF    Git ref to checkout (default: main)
+#   E2E_UPSTREAM_REF    Git ref to checkout (defaults to the World's SDK line)
 #   E2E_APP_NAME        Workbench app to test (default: nextjs-turbopack)
 #   E2E_SKIP_BUILD      Skip building upstream packages (default: false)
 #   E2E_KEEP_SERVICES   Don't stop Docker services on exit (default: false)
@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 UPSTREAM_DIR="${E2E_UPSTREAM_DIR:-$ROOT_DIR/.e2e-upstream}"
-UPSTREAM_REF="${E2E_UPSTREAM_REF:-main}"
+UPSTREAM_REF="${E2E_UPSTREAM_REF:-}"
 UPSTREAM_REPO="https://github.com/vercel/workflow.git"
 APP_NAME="${E2E_APP_NAME:-nextjs-turbopack}"
 SKIP_BUILD="${E2E_SKIP_BUILD:-false}"
@@ -101,7 +101,7 @@ usage() {
   echo ""
   echo -e "${BOLD}Environment Variables:${NC}"
   echo "  E2E_UPSTREAM_DIR    Override upstream clone location (default: .e2e-upstream)"
-  echo "  E2E_UPSTREAM_REF    Git ref to checkout (default: main)"
+  echo "  E2E_UPSTREAM_REF    Git ref to checkout (defaults to the World's SDK line)"
   echo "  E2E_APP_NAME        Workbench app to test (default: nextjs-turbopack)"
   echo "  E2E_SKIP_BUILD      Skip building upstream packages if set to 'true'"
   echo "  E2E_KEEP_SERVICES   Don't stop Docker services on exit if set to 'true'"
@@ -265,6 +265,14 @@ if [[ -z "${WORLD_PACKAGE[$WORLD_ID]+x}" ]]; then
   log_error "Unknown world: $WORLD_ID"
   echo "Valid worlds: ${!WORLD_PACKAGE[*]}"
   exit 1
+fi
+
+if [[ -z "$UPSTREAM_REF" ]]; then
+  if [[ "$WORLD_ID" == "turso" ]]; then
+    UPSTREAM_REF="workflow@5.0.0-beta.40"
+  else
+    UPSTREAM_REF="workflow@4.1.0-beta.54"
+  fi
 fi
 
 PACKAGE="${WORLD_PACKAGE[$WORLD_ID]}"
@@ -507,7 +515,11 @@ export APP_NAME="$APP_NAME"
 export NODE_OPTIONS="--enable-source-maps"
 export WORKFLOW_PUBLIC_MANIFEST="1"
 export WORKFLOW_SERVICE_URL="http://localhost:3000"
-export DEV_TEST_CONFIG="{\"name\":\"$APP_NAME\",\"project\":\"workbench-${APP_NAME}-workflow\",\"generatedStepPath\":\"app/.well-known/workflow/v1/step/route.js\",\"generatedWorkflowPath\":\"app/.well-known/workflow/v1/flow/route.js\",\"apiFilePath\":\"app/api/chat/route.ts\",\"apiFileImportPath\":\"../../..\"}"
+if [[ "$WORLD_ID" == "turso" ]]; then
+  export DEV_TEST_CONFIG="{\"name\":\"$APP_NAME\",\"project\":\"workbench-${APP_NAME}-workflow\",\"generatedStepRegistrationPath\":\"app/.well-known/workflow/v1/flow/__step_registrations.js\",\"generatedWorkflowPath\":\"app/.well-known/workflow/v1/flow/route.js\",\"apiFilePath\":\"app/api/chat/route.ts\",\"apiFileImportPath\":\"../../..\"}"
+else
+  export DEV_TEST_CONFIG="{\"name\":\"$APP_NAME\",\"project\":\"workbench-${APP_NAME}-workflow\",\"generatedStepPath\":\"app/.well-known/workflow/v1/step/route.js\",\"generatedWorkflowPath\":\"app/.well-known/workflow/v1/flow/route.js\",\"apiFilePath\":\"app/api/chat/route.ts\",\"apiFileImportPath\":\"../../..\"}"
+fi
 
 # =============================================================================
 # Step 8: Start dev server and run tests

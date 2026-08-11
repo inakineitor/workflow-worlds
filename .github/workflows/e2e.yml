@@ -21,9 +21,9 @@ on:
         options: ['all', 'turso', 'mongodb', 'redis']
         default: 'all'
       upstream-ref:
-        description: 'vercel/workflow git ref to test against'
+        description: 'vercel/workflow v5 git ref for Turso'
         type: string
-        default: 'main'
+        default: 'workflow@5.0.0-beta.40'
 
 permissions:
   contents: read
@@ -34,7 +34,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  UPSTREAM_REF: ${{ inputs.upstream-ref || 'main' }}
+  LEGACY_UPSTREAM_REF: 'workflow@4.1.0-beta.54'
+  TURSO_UPSTREAM_REF: ${{ inputs.upstream-ref || 'workflow@5.0.0-beta.40' }}
+  UPSTREAM_RUST_TOOLCHAIN: '1.95.0'
   APP_NAME: nextjs-turbopack
 
 jobs:
@@ -60,13 +62,18 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
 
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.UPSTREAM_RUST_TOOLCHAIN }}
+          target: wasm32-unknown-unknown
+
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
       - name: Pack world tarballs
         run: |
           mkdir -p .tarballs
-          for pkg in turso mongodb redis; do
+          for pkg in mongodb redis; do
             (cd "packages/$pkg" && pnpm pack --pack-destination ../../.tarballs)
           done
           echo "::group::Tarballs"
@@ -85,7 +92,7 @@ jobs:
 
       # --- Build upstream (with cache) ---
       - name: Clone upstream
-        run: git clone --depth=1 --branch ${{ env.UPSTREAM_REF }} https://github.com/vercel/workflow.git .upstream
+        run: git clone --depth=1 --branch ${{ env.LEGACY_UPSTREAM_REF }} https://github.com/vercel/workflow.git .upstream
 
       - name: Upstream metadata
         id: upstream-meta
@@ -128,9 +135,84 @@ jobs:
   # E2E tests per world (run in parallel)
   # ============================================================
 
+  build_turso:
+    name: Build Turso v5
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      upstream-cache-key: ${{ steps.upstream-meta.outputs.cache-key }}
+      tarball-cache-key: ${{ steps.tarball-meta.outputs.cache-key }}
+      upstream-pnpm-version: ${{ steps.upstream-meta.outputs.pnpm-version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ env.UPSTREAM_RUST_TOOLCHAIN }}
+          target: wasm32-unknown-unknown
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @workflow-worlds/turso build
+
+      - name: Pack Turso tarball
+        run: |
+          mkdir -p .tarballs-turso
+          (cd packages/turso && pnpm pack --pack-destination ../../.tarballs-turso)
+          ls -lh .tarballs-turso/
+
+      - name: Tarball metadata
+        id: tarball-meta
+        run: echo "cache-key=turso-tarball-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Turso tarball
+        uses: actions/cache@v4
+        with:
+          path: .tarballs-turso
+          key: ${{ steps.tarball-meta.outputs.cache-key }}
+
+      - name: Clone Workflow v5
+        run: git clone --depth=1 --branch ${{ env.TURSO_UPSTREAM_REF }} https://github.com/vercel/workflow.git .upstream-turso
+
+      - name: Workflow v5 metadata
+        id: upstream-meta
+        run: |
+          SHA=$(git -C .upstream-turso rev-parse HEAD)
+          echo "cache-key=upstream-turso-build-${SHA}" >> "$GITHUB_OUTPUT"
+          PNPM_VERSION=$(node -e "const pm = require('./.upstream-turso/package.json').packageManager || ''; console.log(pm.split('@')[1] || '10.15.1')")
+          echo "pnpm-version=${PNPM_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Workflow v5 cache
+        id: upstream-cache
+        uses: actions/cache@v4
+        with:
+          path: .upstream-turso
+          key: ${{ steps.upstream-meta.outputs.cache-key }}
+
+      - name: Install and build Workflow v5
+        if: steps.upstream-cache.outputs.cache-hit != 'true'
+        working-directory: .upstream-turso
+        run: |
+          PNPM_VERSION=$(node -e "const pm = require('./package.json').packageManager || ''; console.log(pm.split('@')[1] || '10.15.1')")
+          npm i -g "pnpm@${PNPM_VERSION}"
+          pnpm install --frozen-lockfile
+          pnpm turbo run build --filter='!./workbench/*'
+
+      - name: Trim Workflow v5 cache
+        if: steps.upstream-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf .upstream-turso/.git
+          find .upstream-turso -name node_modules -type d -prune -exec rm -rf {} +
+
   e2e-turso:
     name: E2E - Turso
-    needs: build
+    needs: build_turso
     if: >-
       github.event_name != 'workflow_dispatch' ||
       inputs.world == 'all' ||
@@ -141,60 +223,60 @@ jobs:
       - name: Restore upstream
         uses: actions/cache/restore@v4
         with:
-          path: .upstream
-          key: ${{ needs.build.outputs.upstream-cache-key }}
+          path: .upstream-turso
+          key: ${{ needs.build_turso.outputs.upstream-cache-key }}
           fail-on-cache-miss: true
 
       - name: Restore tarballs
         uses: actions/cache/restore@v4
         with:
-          path: .tarballs
-          key: ${{ needs.build.outputs.tarball-cache-key }}
+          path: .tarballs-turso
+          key: ${{ needs.build_turso.outputs.tarball-cache-key }}
           fail-on-cache-miss: true
 
       - uses: pnpm/action-setup@v4
         with:
-          version: ${{ needs.build.outputs.upstream-pnpm-version }}
+          version: ${{ needs.build_turso.outputs.upstream-pnpm-version }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'pnpm'
-          cache-dependency-path: .upstream/pnpm-lock.yaml
+          cache-dependency-path: .upstream-turso/pnpm-lock.yaml
 
       - name: Install upstream dependencies
-        working-directory: .upstream
+        working-directory: .upstream-turso
         run: pnpm install --frozen-lockfile
 
       - name: Install turso world
-        working-directory: .upstream
+        working-directory: .upstream-turso
         run: |
-          TARBALL=$(readlink -f ../.tarballs/workflow-worlds-turso-*.tgz | head -1)
+          TARBALL=$(readlink -f ../.tarballs-turso/workflow-worlds-turso-*.tgz | head -1)
           pnpm --filter ${{ env.APP_NAME }} add "$TARBALL"
 
       - name: Setup turso database
-        working-directory: .upstream/workbench/${{ env.APP_NAME }}
+        working-directory: .upstream-turso/workbench/${{ env.APP_NAME }}
         run: pnpm exec workflow-turso-setup
         env:
-          WORKFLOW_TURSO_DATABASE_URL: 'file:${{ github.workspace }}/.upstream/workbench/nextjs-turbopack/workflow.db'
+          WORKFLOW_TURSO_DATABASE_URL: 'file:${{ github.workspace }}/.upstream-turso/workbench/nextjs-turbopack/workflow.db'
 
       - name: Resolve symlinks
-        working-directory: .upstream
+        working-directory: .upstream-turso
         run: CI=true bash scripts/resolve-symlinks.sh workbench/${{ env.APP_NAME }}
 
       - name: Run E2E tests
-        working-directory: .upstream
+        working-directory: .upstream-turso
         env:
           NODE_OPTIONS: '--enable-source-maps'
           APP_NAME: nextjs-turbopack
           DEPLOYMENT_URL: 'http://localhost:3000'
           WORKFLOW_TARGET_WORLD: '@workflow-worlds/turso'
-          WORKFLOW_TURSO_DATABASE_URL: 'file:${{ github.workspace }}/.upstream/workbench/nextjs-turbopack/workflow.db'
+          WORKFLOW_TURSO_DATABASE_URL: 'file:${{ github.workspace }}/.upstream-turso/workbench/nextjs-turbopack/workflow.db'
           WORKFLOW_PUBLIC_MANIFEST: '1'
           WORKFLOW_SERVICE_URL: 'http://localhost:3000'
           DEV_TEST_CONFIG: >-
             {"name":"nextjs-turbopack","project":"workbench-nextjs-turbopack-workflow",
-            "generatedStepPath":"app/.well-known/workflow/v1/step/route.js",
+            "generatedStepRegistrationPath":"app/.well-known/workflow/v1/flow/__step_registrations.js",
             "generatedWorkflowPath":"app/.well-known/workflow/v1/flow/route.js",
             "apiFilePath":"app/api/chat/route.ts","apiFileImportPath":"../../.."}
         run: |
@@ -207,7 +289,7 @@ jobs:
 
       - name: Show server logs on failure
         if: failure()
-        working-directory: .upstream
+        working-directory: .upstream-turso
         run: echo "=== Dev server logs ===" && tail -200 server-turso.log || true
 
       - name: Upload results
@@ -216,8 +298,8 @@ jobs:
         with:
           name: e2e-results-turso
           path: |
-            .upstream/e2e-turso.json
-            .upstream/server-turso.log
+            .upstream-turso/e2e-turso.json
+            .upstream-turso/server-turso.log
           retention-days: 7
           if-no-files-found: ignore
 

@@ -1,303 +1,250 @@
-/**
- * Turso Streamer Implementation
- *
- * Implements the Streamer interface using Turso/libSQL for chunk storage
- * and EventEmitter for real-time notifications (single-process).
- */
-
-import { EventEmitter } from 'node:events';
-import type { Client, Row } from '@libsql/client';
+import { setTimeout as sleep } from 'node:timers/promises';
+import type { Client, InValue, Row } from '@libsql/client';
 import type { Streamer } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
 
-const generateUlid = monotonicFactory();
+const DEFAULT_PAGE_SIZE = 100;
+const MAX_PAGE_SIZE = 1000;
 
-/**
- * Represents a single chunk in a stream.
- */
-interface StreamChunk {
-  chunkId: string;
-  data: Uint8Array;
-  eof: boolean;
-}
-
-/**
- * Configuration for the streamer.
- */
 export interface StreamerConfig {
-  /**
-   * Turso client instance.
-   */
   client: Client;
+  pollIntervalMs?: number;
 }
 
-/**
- * Converts a database row to a StreamChunk object.
- */
-function rowToChunk(row: Row): StreamChunk {
-  let data: Uint8Array;
+export type TursoStreamer = Streamer & {
+  close(): Promise<void>;
+};
 
-  // Handle different data types from the database
-  const rawData = row.data;
-  if (rawData === null || rawData === undefined) {
-    data = new Uint8Array(0);
-  } else if (rawData instanceof ArrayBuffer) {
-    data = new Uint8Array(rawData);
-  } else if (ArrayBuffer.isView(rawData)) {
-    data = new Uint8Array(rawData.buffer, rawData.byteOffset, rawData.byteLength);
-  } else if (typeof rawData === 'string') {
-    data = new TextEncoder().encode(rawData);
-  } else {
-    // Fallback for other types
-    data = new Uint8Array(0);
+function toBytes(value: unknown): Uint8Array {
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
   }
-
-  return {
-    chunkId: row.chunk_id as string,
-    data,
-    eof: (row.is_eof as number) === 1,
-  };
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (typeof value === 'string') {
+    return new TextEncoder().encode(value);
+  }
+  return new Uint8Array();
 }
 
-/**
- * Creates the Streamer implementation using Turso/libSQL.
- */
-export function createStreamer(config: StreamerConfig): Streamer {
+function encodeChunk(chunk: string | Uint8Array): Uint8Array {
+  return typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk;
+}
+
+function parseCursor(cursor: string | undefined): number {
+  if (cursor === undefined) {
+    return 0;
+  }
+  const value = Number(cursor);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid stream cursor: ${cursor}`);
+  }
+  return value;
+}
+
+function rowIndex(row: Row): number {
+  return Number(row.chunk_index);
+}
+
+export function createStreamer(config: StreamerConfig): TursoStreamer {
   const { client } = config;
+  const pollIntervalMs = config.pollIntervalMs ?? 50;
+  const readers = new Set<AbortController>();
+  let closed = false;
 
-  // Event emitter for real-time notifications
-  // For multi-process, use external pub/sub (Redis, etc.)
-  const emitter = new EventEmitter<{
-    [key: `chunk:${string}`]: [StreamChunk];
-    [key: `close:${string}`]: [];
-  }>();
-
-  // Increase listener limit for high-concurrency scenarios
-  emitter.setMaxListeners(100);
-
-  async function registerStream(
-    runId: string,
-    streamName: string
-  ): Promise<void> {
+  async function ensureStream(runId: string, name: string): Promise<void> {
+    const now = new Date().toISOString();
     await client.execute({
-      sql: `INSERT OR IGNORE INTO stream_runs (run_id, stream_name, created_at)
-            VALUES (?, ?, ?)`,
-      args: [runId, streamName, new Date().toISOString()],
+      sql: `INSERT OR IGNORE INTO workflow_streams
+            (run_id, stream_name, tail_index, done, created_at, updated_at)
+            VALUES (?, ?, -1, 0, ?, ?)`,
+      args: [runId, name, now, now],
     });
   }
 
-  return {
-    /**
-     * Writes a chunk of data to a named stream.
-     */
-    async writeToStream(
-      name: string,
-      runId: string | Promise<string>,
-      chunk: string | Uint8Array
-    ): Promise<void> {
-      // Await runId if it's a promise (ensures proper ordering)
-      const resolvedRunId = await runId;
-      await registerStream(resolvedRunId, name);
+  async function appendChunks(
+    runId: string,
+    name: string,
+    chunks: readonly (string | Uint8Array)[]
+  ): Promise<void> {
+    if (closed) {
+      throw new Error('The Turso streamer is closed');
+    }
+    if (chunks.length === 0) {
+      return;
+    }
 
-      const chunkId = `chnk_${generateUlid()}`;
-      const nowStr = new Date().toISOString();
+    await ensureStream(runId, name);
 
-      // Convert to Uint8Array
-      let data: Uint8Array;
-      if (typeof chunk === 'string') {
-        data = new TextEncoder().encode(chunk);
-      } else {
-        data = chunk;
+    const values = chunks.map(() => '(?, ?)').join(', ');
+    const valueArgs = chunks.flatMap((chunk, offset) => [
+      offset,
+      encodeChunk(chunk) as InValue,
+    ]);
+    const now = new Date().toISOString();
+    const result = await client.execute({
+      sql: `WITH stream AS MATERIALIZED (
+              SELECT tail_index + 1 AS start_index
+              FROM workflow_streams
+              WHERE run_id = ? AND stream_name = ? AND done = 0
+            ), chunks(chunk_offset, data) AS (
+              VALUES ${values}
+            )
+            INSERT INTO workflow_stream_chunks
+              (run_id, stream_name, chunk_index, data, created_at)
+            SELECT ?, ?, stream.start_index + chunks.chunk_offset,
+              chunks.data, ?
+            FROM stream CROSS JOIN chunks
+            RETURNING chunk_index`,
+      args: [runId, name, ...valueArgs, runId, name, now],
+    });
+
+    if (result.rows.length !== chunks.length) {
+      throw new Error(`Cannot write to closed stream ${name}`);
+    }
+  }
+
+  const streams: Streamer['streams'] = {
+    async write(runId, name, chunk) {
+      await appendChunks(runId, name, [chunk]);
+    },
+
+    async writeMulti(runId, name, chunks) {
+      await appendChunks(runId, name, chunks);
+    },
+
+    async close(runId, name) {
+      if (closed) {
+        throw new Error('The Turso streamer is closed');
+      }
+      await ensureStream(runId, name);
+      await client.execute({
+        sql: `UPDATE workflow_streams
+              SET done = 1, updated_at = ?
+              WHERE run_id = ? AND stream_name = ?`,
+        args: [new Date().toISOString(), runId, name],
+      });
+    },
+
+    async get(runId, name, requestedStartIndex = 0) {
+      const controller = new AbortController();
+      readers.add(controller);
+
+      let startIndex = requestedStartIndex;
+      if (startIndex < 0) {
+        const info = await streams.getInfo(runId, name);
+        startIndex = Math.max(0, info.tailIndex + 1 + startIndex);
       }
 
-      // Store the chunk as a blob
-      await client.execute({
-        sql: `INSERT INTO stream_chunks (chunk_id, stream_name, data, is_eof, created_at)
-              VALUES (?, ?, ?, 0, ?)`,
-        args: [chunkId, name, data, nowStr],
-      });
-
-      // Emit real-time notification
-      const streamChunk: StreamChunk = { chunkId, data, eof: false };
-      emitter.emit(`chunk:${name}`, streamChunk);
-    },
-
-    /**
-     * Signals the end of a stream.
-     */
-    async closeStream(
-      name: string,
-      runId: string | Promise<string>
-    ): Promise<void> {
-      const resolvedRunId = await runId;
-      await registerStream(resolvedRunId, name);
-
-      const chunkId = `chnk_${generateUlid()}`;
-      const nowStr = new Date().toISOString();
-
-      // Store EOF marker
-      await client.execute({
-        sql: `INSERT INTO stream_chunks (chunk_id, stream_name, data, is_eof, created_at)
-              VALUES (?, ?, NULL, 1, ?)`,
-        args: [chunkId, name, nowStr],
-      });
-
-      // Notify subscribers that stream is closed
-      emitter.emit(`close:${name}`);
-    },
-
-    async listStreamsByRunId(runId: string): Promise<string[]> {
-      const result = await client.execute({
-        sql: `SELECT stream_name FROM stream_runs
-              WHERE run_id = ?
-              ORDER BY stream_name ASC`,
-        args: [runId],
-      });
-      return result.rows.map((row) => row.stream_name as string);
-    },
-
-    /**
-     * Returns a ReadableStream for consuming stream data.
-     */
-    async readFromStream(
-      name: string,
-      startIndex = 0
-    ): Promise<ReadableStream<Uint8Array>> {
-      // Store cleanup function so cancel() can access it
-      let cleanup: (() => void) | null = null;
-
       return new ReadableStream<Uint8Array>({
-        start(controller) {
-          // Track chunks we've already delivered to prevent duplicates
-          const deliveredChunkIds = new Set<string>();
-
-          // Buffer for chunks that arrive during initial load
-          const bufferedEventChunks: StreamChunk[] = [];
-          let isLoadingFromStorage = true;
-          let closeRequested = false;
-
-          // Handler for new chunks (real-time)
-          const chunkHandler = (chunk: StreamChunk) => {
-            // Skip if already delivered
-            if (deliveredChunkIds.has(chunk.chunkId)) {
-              return;
-            }
-            deliveredChunkIds.add(chunk.chunkId);
-
-            // Skip empty chunks (except EOF)
-            if (chunk.data.byteLength === 0 && !chunk.eof) {
-              return;
-            }
-
-            if (isLoadingFromStorage) {
-              // Buffer chunks that arrive during initial load
-              bufferedEventChunks.push(chunk);
-            } else {
-              // Deliver immediately after initial load
-              if (chunk.data.byteLength > 0) {
-                // Create a copy to prevent ArrayBuffer detachment
-                controller.enqueue(Uint8Array.from(chunk.data));
-              }
-            }
-          };
-
-          // Handler for stream close
-          const closeHandler = () => {
-            if (isLoadingFromStorage) {
-              // Don't close immediately during initial load. A close event can
-              // race ahead of buffered chunk delivery.
-              closeRequested = true;
-              return;
-            }
-            cleanup?.();
+        start(streamController) {
+          void (async () => {
+            let nextIndex = startIndex;
             try {
-              controller.close();
-            } catch {
-              // Ignore if already closed
-            }
-          };
+              while (!controller.signal.aborted) {
+                const result = await client.execute({
+                  sql: `SELECT chunk_index, data FROM workflow_stream_chunks
+                        WHERE run_id = ? AND stream_name = ? AND chunk_index >= ?
+                        ORDER BY chunk_index ASC LIMIT 100`,
+                  args: [runId, name, nextIndex],
+                });
 
-          // Cleanup function - removes only this reader's handlers
-          cleanup = () => {
-            emitter.off(`chunk:${name}`, chunkHandler);
-            emitter.off(`close:${name}`, closeHandler);
-          };
+                for (const row of result.rows) {
+                  const index = rowIndex(row);
+                  streamController.enqueue(Uint8Array.from(toBytes(row.data)));
+                  nextIndex = index + 1;
+                }
 
-          // Subscribe to events FIRST (before loading from storage)
-          emitter.on(`chunk:${name}`, chunkHandler);
-          emitter.on(`close:${name}`, closeHandler);
-
-          // Load existing chunks from storage (async)
-          (async () => {
-            try {
-              const result = await client.execute({
-                sql: `SELECT * FROM stream_chunks
-                      WHERE stream_name = ?
-                      ORDER BY chunk_id ASC`,
-                args: [name],
-              });
-
-              const existingChunks = result.rows.map(rowToChunk);
-
-              for (let i = startIndex; i < existingChunks.length; i++) {
-                const chunk = existingChunks[i];
-
-                // Check for EOF
-                if (chunk.eof) {
-                  cleanup?.();
-                  controller.close();
+                const info = await streams.getInfo(runId, name);
+                if (info.done && nextIndex > info.tailIndex) {
+                  streamController.close();
                   return;
                 }
 
-                // Skip if already delivered via event
-                if (deliveredChunkIds.has(chunk.chunkId)) {
-                  continue;
-                }
-                deliveredChunkIds.add(chunk.chunkId);
-
-                // Deliver the chunk
-                if (chunk.data.byteLength > 0) {
-                  // Create a copy to prevent ArrayBuffer detachment
-                  controller.enqueue(Uint8Array.from(chunk.data));
-                }
+                await sleep(pollIntervalMs, undefined, {
+                  signal: controller.signal,
+                  ref: false,
+                });
               }
-
-              // Done loading from storage
-              isLoadingFromStorage = false;
-
-              // Deliver buffered event chunks in order
-              bufferedEventChunks.sort((a, b) =>
-                a.chunkId.localeCompare(b.chunkId)
-              );
-
-              for (const chunk of bufferedEventChunks) {
-                if (chunk.eof) {
-                  cleanup?.();
-                  controller.close();
-                  return;
-                }
-                if (chunk.data.byteLength > 0) {
-                  controller.enqueue(Uint8Array.from(chunk.data));
-                }
-              }
-
-              if (closeRequested) {
-                cleanup?.();
-                controller.close();
-              }
-
             } catch (error) {
-              cleanup?.();
-              controller.error(error);
+              if (!controller.signal.aborted) {
+                streamController.error(error);
+              }
+            } finally {
+              readers.delete(controller);
             }
           })();
         },
-
         cancel() {
-          // Clean up only this reader's listeners when stream is cancelled
-          cleanup?.();
+          controller.abort();
+          readers.delete(controller);
         },
       });
+    },
+
+    async list(runId) {
+      const result = await client.execute({
+        sql: `SELECT stream_name FROM workflow_streams
+              WHERE run_id = ? ORDER BY stream_name ASC`,
+        args: [runId],
+      });
+      return result.rows.map((row) => String(row.stream_name));
+    },
+
+    async getChunks(runId, name, options) {
+      const startIndex = parseCursor(options?.cursor);
+      const limit = Math.min(
+        MAX_PAGE_SIZE,
+        Math.max(1, options?.limit ?? DEFAULT_PAGE_SIZE)
+      );
+      const result = await client.execute({
+        sql: `SELECT chunk_index, data FROM workflow_stream_chunks
+              WHERE run_id = ? AND stream_name = ? AND chunk_index >= ?
+              ORDER BY chunk_index ASC LIMIT ?`,
+        args: [runId, name, startIndex, limit + 1],
+      });
+      const hasMore = result.rows.length > limit;
+      const rows = result.rows.slice(0, limit);
+      const data = rows.map((row) => ({
+        index: rowIndex(row),
+        data: Uint8Array.from(toBytes(row.data)),
+      }));
+      const last = data.at(-1);
+      const info = await streams.getInfo(runId, name);
+
+      return {
+        data,
+        cursor: hasMore && last ? String(last.index + 1) : null,
+        hasMore,
+        done: info.done,
+      };
+    },
+
+    async getInfo(runId, name) {
+      const result = await client.execute({
+        sql: `SELECT tail_index, done FROM workflow_streams
+              WHERE run_id = ? AND stream_name = ?`,
+        args: [runId, name],
+      });
+      const row = result.rows[0];
+      return {
+        tailIndex: row ? Number(row.tail_index) : -1,
+        done: row ? Number(row.done) === 1 : false,
+      };
+    },
+  };
+
+  return {
+    streams,
+    async close() {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      for (const reader of readers) {
+        reader.abort();
+      }
+      readers.clear();
     },
   };
 }

@@ -1,14 +1,19 @@
 /**
  * Turso Storage Implementation
  *
- * Implements Storage using Turso/libSQL with an internal legacy mutator layer,
- * then exposes the Workflow 4.1 event-sourced public Storage surface.
+ * Implements Storage using Turso/libSQL with an internal mutator layer, then
+ * exposes the Workflow v5 event-sourced public Storage surface.
  */
 
 import type { Client } from '@libsql/client';
+import { encode } from 'cbor-x';
 import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
   RunNotSupportedError,
-  WorkflowAPIError,
+  WorkflowRunNotFoundError,
+  WorkflowWorldError as WorkflowAPIError,
 } from '@workflow/errors';
 import type {
   AnyEventRequest,
@@ -20,17 +25,36 @@ import type {
   EventResult,
   Hook,
   PaginatedResponse,
+  ResolveData,
   Step,
   Storage,
   UpdateStepRequest,
+  Wait,
   WorkflowRun,
 } from '@workflow/world';
 import {
+  applyAttributeChanges,
+  isChildEntityCreationEvent,
   isLegacySpecVersion,
   requiresNewerWorld,
   SPEC_VERSION_CURRENT,
+  stripEventDataRefs,
+  validateAttributeChanges,
 } from '@workflow/world';
-import { and, asc, desc, eq, gt, lt } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  notExists,
+  or,
+} from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/libsql';
 import { monotonicFactory } from 'ulid';
 import * as schema from './drizzle/schema.js';
@@ -41,7 +65,9 @@ type UpdateWorkflowRunRequest = {
   status?: WorkflowRun['status'];
   output?: unknown;
   error?: WorkflowRun['error'];
+  errorCode?: string;
   executionContext?: Record<string, unknown>;
+  attributes?: Record<string, string>;
 };
 
 type ResolveDataParams = { resolveData?: 'none' | 'all' };
@@ -49,10 +75,19 @@ type ResolveDataParams = { resolveData?: 'none' | 'all' };
 type LegacyStorage = {
   runs: {
     create(
-      data: CreateWorkflowRunRequest & { specVersion?: number; runId?: string }
+      data: CreateWorkflowRunRequest & {
+        specVersion?: number;
+        runId?: string;
+        encryptionPublicKey?: string;
+      }
     ): Promise<WorkflowRun>;
     get(id: string, params?: ResolveDataParams): Promise<WorkflowRun>;
     update(id: string, data: UpdateWorkflowRunRequest): Promise<WorkflowRun>;
+    updateAttributes(
+      id: string,
+      changes: Parameters<typeof applyAttributeChanges>[1],
+      allowReservedAttributes: boolean
+    ): Promise<WorkflowRun>;
     list(params?: any): Promise<PaginatedResponse<WorkflowRun>>;
   };
   steps: {
@@ -61,7 +96,7 @@ type LegacyStorage = {
       data: CreateStepRequest & { specVersion?: number }
     ): Promise<Step>;
     get(
-      runId: string | undefined,
+      runId: string,
       stepId: string,
       params?: ResolveDataParams
     ): Promise<Step>;
@@ -74,13 +109,19 @@ type LegacyStorage = {
       data: AnyEventRequest,
       params?: CreateEventParams
     ): Promise<Event>;
+    get(runId: string, eventId: string, params?: ResolveDataParams): Promise<Event>;
     list(params: any): Promise<PaginatedResponse<Event>>;
     listByCorrelationId(params: any): Promise<PaginatedResponse<Event>>;
   };
   hooks: {
     create(
       runId: string,
-      data: CreateHookRequest & { specVersion?: number },
+      data: CreateHookRequest & {
+        specVersion?: number;
+        isSystem?: boolean;
+        tokenRetentionUntil?: Date;
+        resumeContext?: Hook['resumeContext'];
+      },
       params?: ResolveDataParams
     ): Promise<Hook>;
     get(hookId: string, params?: ResolveDataParams): Promise<Hook>;
@@ -125,15 +166,9 @@ function filterStepData(step: Step, resolveData: 'none' | 'all' = 'all'): Step {
 
 function filterEventData(
   event: Event,
-  resolveData: 'none' | 'all' = 'all'
+  resolveData: ResolveData = 'all'
 ): Event {
-  const cloned = deepClone(event);
-  if (resolveData === 'none') {
-    if ('eventData' in cloned) {
-      delete (cloned as Record<string, unknown>).eventData;
-    }
-  }
-  return cloned;
+  return stripEventDataRefs(deepClone(event), resolveData);
 }
 
 function filterHookData(hook: Hook, resolveData: 'none' | 'all' = 'all'): Hook {
@@ -164,10 +199,14 @@ function toWorkflowRun(row: RunRow, specVersion?: number): WorkflowRun {
     workflowName: row.workflowName,
     specVersion,
     status: row.status as WorkflowRun['status'],
-    input: row.input ?? [],
+    input: row.input,
     output: row.output,
     error: row.error ?? undefined,
+    errorCode: row.errorCode ?? undefined,
     executionContext: row.executionContext,
+    attributes: row.attributes ?? {},
+    encryptionPublicKey: row.encryptionPublicKey ?? undefined,
+    expiredAt: toDate(row.expiredAt),
     startedAt: toDate(row.startedAt),
     completedAt: toDate(row.completedAt),
     createdAt: toDate(row.createdAt) ?? new Date(),
@@ -182,7 +221,7 @@ function toStep(row: StepRow, specVersion?: number): Step {
     stepName: row.stepName ?? '',
     specVersion,
     status: row.status as Step['status'],
-    input: row.input ?? [],
+    input: row.input,
     output: row.output,
     error: (row.error ?? undefined) as Step['error'],
     attempt: row.attempt ?? 0,
@@ -201,6 +240,8 @@ function toEvent(row: EventRow): Event {
     runId: row.runId,
     createdAt: toDate(row.createdAt) ?? new Date(),
     ...payload,
+    occurredAt: toDate(row.occurredAt),
+    resumeId: row.resumeId ?? undefined,
   } as Event;
 }
 
@@ -210,11 +251,30 @@ function toHook(row: HookRow, specVersion?: number): Hook {
     runId: row.runId,
     token: row.token,
     metadata: row.metadata ?? undefined,
+    isWebhook: row.isWebhook ?? undefined,
+    isSystem: row.isSystem ?? undefined,
+    tokenRetentionUntil: toDate(row.tokenRetentionUntil),
+    resumeContext: row.resumeContext as Hook['resumeContext'],
     ownerId: row.ownerId,
     projectId: row.projectId,
     environment: row.environment,
     createdAt: toDate(row.createdAt) ?? new Date(),
     specVersion,
+  };
+}
+
+type WaitRow = typeof schema.waits.$inferSelect;
+
+function toWait(row: WaitRow): Wait {
+  return {
+    waitId: row.waitId,
+    runId: row.runId,
+    status: row.status as Wait['status'],
+    resumeAt: toDate(row.resumeAt),
+    completedAt: toDate(row.completedAt),
+    createdAt: toDate(row.createdAt) ?? new Date(),
+    updatedAt: toDate(row.updatedAt) ?? new Date(),
+    specVersion: row.specVersion ?? undefined,
   };
 }
 
@@ -224,6 +284,24 @@ export interface StorageConfig {
 
 export function createStorage(config: StorageConfig): Storage {
   const db = drizzle(config.client, { schema });
+  const terminalRunStatuses = ['completed', 'failed', 'cancelled'];
+
+  function availableHookAt(isoTimestamp: string) {
+    const ownerRunIsTerminal = db
+      .select({ runId: schema.runs.runId })
+      .from(schema.runs)
+      .where(
+        and(
+          eq(schema.runs.runId, schema.hooks.runId),
+          inArray(schema.runs.status, terminalRunStatuses)
+        )
+      );
+
+    return or(
+      gt(schema.hooks.tokenRetentionUntil, isoTimestamp),
+      notExists(ownerRunIsTerminal)
+    );
+  }
 
   async function setRunSpecVersion(runId: string, specVersion: number): Promise<void> {
     await config.client.execute({
@@ -249,7 +327,11 @@ export function createStorage(config: StorageConfig): Storage {
   const legacyStorage: LegacyStorage = {
     runs: {
       async create(
-        data: CreateWorkflowRunRequest & { specVersion?: number; runId?: string }
+        data: CreateWorkflowRunRequest & {
+          specVersion?: number;
+          runId?: string;
+          encryptionPublicKey?: string;
+        }
       ): Promise<WorkflowRun> {
         const runId = data.runId ?? `wrun_${generateUlid()}`;
         const now = new Date();
@@ -260,8 +342,10 @@ export function createStorage(config: StorageConfig): Storage {
           deploymentId: data.deploymentId,
           workflowName: data.workflowName,
           status: 'pending',
-          input: (data.input ?? []) as unknown[],
+          input: data.input,
           executionContext: data.executionContext as Record<string, unknown>,
+          attributes: data.attributes ?? {},
+          encryptionPublicKey: data.encryptionPublicKey,
           createdAt: nowStr,
           updatedAt: nowStr,
         });
@@ -276,9 +360,12 @@ export function createStorage(config: StorageConfig): Storage {
           status: 'pending',
           workflowName: data.workflowName,
           specVersion: data.specVersion,
-          input: (data.input ?? []) as unknown[],
+          input: data.input,
           output: undefined,
           error: undefined,
+          errorCode: undefined,
+          attributes: data.attributes ?? {},
+          encryptionPublicKey: data.encryptionPublicKey,
           executionContext: data.executionContext as
             | Record<string, unknown>
             | undefined,
@@ -297,7 +384,7 @@ export function createStorage(config: StorageConfig): Storage {
           .limit(1);
 
         if (result.length === 0) {
-          throw new WorkflowAPIError(`Run not found: ${id}`, { status: 404 });
+          throw new WorkflowRunNotFoundError(id);
         }
 
         const run = toWorkflowRun(result[0], await getRunSpecVersion(id));
@@ -305,45 +392,116 @@ export function createStorage(config: StorageConfig): Storage {
       },
 
       async update(id: string, data: UpdateWorkflowRunRequest): Promise<WorkflowRun> {
-        const existing = await this.get(id, { resolveData: 'all' });
-        const now = new Date();
-        const nowStr = now.toISOString();
+        while (true) {
+          const existing = await this.get(id, { resolveData: 'all' });
+          const now = new Date(
+            Math.max(Date.now(), existing.updatedAt.getTime() + 1)
+          );
+          const nowStr = now.toISOString();
 
-        const updated: WorkflowRun = {
-          ...existing,
-          ...data,
-          updatedAt: now,
-        } as WorkflowRun;
+          const updated: WorkflowRun = {
+            ...existing,
+            ...data,
+            updatedAt: now,
+          } as WorkflowRun;
 
-        if (data.status === 'running' && !updated.startedAt) {
-          updated.startedAt = now;
+          if (data.status === 'running' && !updated.startedAt) {
+            updated.startedAt = now;
+          }
+
+          const isTerminal =
+            data.status === 'completed' ||
+            data.status === 'failed' ||
+            data.status === 'cancelled';
+
+          if (isTerminal) {
+            updated.completedAt = now;
+          }
+
+          const [updatedRow] = await db
+            .update(schema.runs)
+            .set({
+              status: updated.status,
+              input: updated.input,
+              output: updated.output,
+              error: updated.error,
+              errorCode: updated.errorCode,
+              executionContext: updated.executionContext,
+              attributes: updated.attributes,
+              startedAt: toIsoString(updated.startedAt),
+              completedAt: toIsoString(updated.completedAt),
+              updatedAt: nowStr,
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, id),
+                eq(schema.runs.updatedAt, existing.updatedAt.toISOString())
+              )
+            )
+            .returning();
+
+          if (!updatedRow) {
+            continue;
+          }
+
+          if (isTerminal) {
+            await Promise.all([
+              db
+                .delete(schema.hooks)
+                .where(
+                  and(
+                    eq(schema.hooks.runId, id),
+                    or(
+                      isNull(schema.hooks.tokenRetentionUntil),
+                      lte(schema.hooks.tokenRetentionUntil, nowStr)
+                    )
+                  )
+                ),
+              db.delete(schema.waits).where(eq(schema.waits.runId, id)),
+            ]);
+          }
+
+          return toWorkflowRun(
+            updatedRow,
+            await getRunSpecVersion(id)
+          );
         }
+      },
 
-        const isTerminal =
-          data.status === 'completed' ||
-          data.status === 'failed' ||
-          data.status === 'cancelled';
-
-        if (isTerminal) {
-          updated.completedAt = now;
-          await db.delete(schema.hooks).where(eq(schema.hooks.runId, id));
+      async updateAttributes(
+        id: string,
+        changes: Parameters<typeof applyAttributeChanges>[1],
+        allowReservedAttributes: boolean
+      ): Promise<WorkflowRun> {
+        while (true) {
+          const existing = await this.get(id, { resolveData: 'all' });
+          validateAttributeChanges(changes, {
+            existingKeys: Object.keys(existing.attributes),
+            allowReservedAttributes,
+          });
+          const now = new Date(
+            Math.max(Date.now(), existing.updatedAt.getTime() + 1)
+          );
+          const [updatedRow] = await db
+            .update(schema.runs)
+            .set({
+              attributes: applyAttributeChanges(existing.attributes, changes),
+              updatedAt: now.toISOString(),
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, id),
+                eq(schema.runs.updatedAt, existing.updatedAt.toISOString())
+              )
+            )
+            .returning();
+          if (updatedRow) {
+            return toWorkflowRun(
+              updatedRow,
+              await getRunSpecVersion(id)
+            );
+          }
         }
-
-        await db
-          .update(schema.runs)
-          .set({
-            status: updated.status,
-            input: updated.input as unknown[],
-            output: updated.output,
-            error: updated.error,
-            executionContext: updated.executionContext,
-            startedAt: toIsoString(updated.startedAt),
-            completedAt: toIsoString(updated.completedAt),
-            updatedAt: nowStr,
-          })
-          .where(eq(schema.runs.runId, id));
-
-        return updated;
       },
 
       async list(params?: any): Promise<PaginatedResponse<WorkflowRun>> {
@@ -412,7 +570,7 @@ export function createStorage(config: StorageConfig): Storage {
           stepId: data.stepId,
           stepName: data.stepName ?? null,
           status: 'pending',
-          input: (data.input ?? []) as unknown[],
+          input: data.input,
           attempt: 0,
           createdAt: nowStr,
           updatedAt: nowStr,
@@ -424,7 +582,7 @@ export function createStorage(config: StorageConfig): Storage {
           stepName: data.stepName,
           specVersion: data.specVersion,
           status: 'pending',
-          input: data.input as unknown[],
+          input: data.input,
           output: undefined,
           error: undefined,
           attempt: 0,
@@ -436,26 +594,16 @@ export function createStorage(config: StorageConfig): Storage {
       },
 
       async get(
-        runId: string | undefined,
+        runId: string,
         stepId: string,
         params?: ResolveDataParams
       ): Promise<Step> {
-        let result;
-
-        if (!runId) {
-          result = await db
-            .select()
-            .from(schema.steps)
-            .where(eq(schema.steps.stepId, stepId))
-            .limit(1);
-        } else {
-          const id = `${runId}-${stepId}`;
-          result = await db
-            .select()
-            .from(schema.steps)
-            .where(eq(schema.steps.id, id))
-            .limit(1);
-        }
+        const id = `${runId}-${stepId}`;
+        const result = await db
+          .select()
+          .from(schema.steps)
+          .where(eq(schema.steps.id, id))
+          .limit(1);
 
         if (result.length === 0) {
           throw new WorkflowAPIError(`Step not found: ${stepId}`, { status: 404 });
@@ -489,7 +637,7 @@ export function createStorage(config: StorageConfig): Storage {
           .update(schema.steps)
           .set({
             status: updated.status,
-            input: updated.input as unknown[],
+            input: updated.input,
             output: updated.output,
             error: updated.error,
             attempt: updated.attempt,
@@ -548,6 +696,8 @@ export function createStorage(config: StorageConfig): Storage {
           correlationId: data.correlationId ?? null,
           payload: data as Record<string, unknown>,
           createdAt: nowStr,
+          occurredAt: toIsoString(params?.occurredAt),
+          resumeId: params?.resumeId ?? null,
         });
 
         const event: Event = {
@@ -555,9 +705,35 @@ export function createStorage(config: StorageConfig): Storage {
           runId,
           eventId,
           createdAt: now,
+          occurredAt: params?.occurredAt,
+          resumeId: params?.resumeId,
         } as Event;
 
         return filterEventData(event, params?.resolveData);
+      },
+
+      async get(
+        runId: string,
+        eventId: string,
+        params?: ResolveDataParams
+      ): Promise<Event> {
+        const result = await db
+          .select()
+          .from(schema.events)
+          .where(
+            and(
+              eq(schema.events.runId, runId),
+              eq(schema.events.eventId, eventId)
+            )
+          )
+          .limit(1);
+        const row = result[0];
+        if (!row) {
+          throw new WorkflowAPIError(`Event not found: ${eventId}`, {
+            status: 404,
+          });
+        }
+        return filterEventData(toEvent(row), params?.resolveData);
       },
 
       async list(params: any): Promise<PaginatedResponse<Event>> {
@@ -589,7 +765,7 @@ export function createStorage(config: StorageConfig): Storage {
         const hasMore = result.length > limit;
         const rows = result.slice(0, limit);
         const data = rows.map((row) => toEvent(row));
-        const nextCursor = hasMore ? data[data.length - 1]?.eventId : null;
+        const nextCursor = data.at(-1)?.eventId ?? null;
 
         return {
           data: data.map((e) => filterEventData(e, params.resolveData)),
@@ -602,10 +778,23 @@ export function createStorage(config: StorageConfig): Storage {
         const sortOrder = params.pagination?.sortOrder ?? 'asc';
         const limit = params.pagination?.limit ?? 100;
 
+        const conditions = [
+          eq(schema.events.runId, params.runId),
+          eq(schema.events.correlationId, params.correlationId),
+        ];
+        const cursor = params.pagination?.cursor;
+        if (cursor) {
+          conditions.push(
+            sortOrder === 'asc'
+              ? gt(schema.events.eventId, cursor)
+              : lt(schema.events.eventId, cursor)
+          );
+        }
+
         const result = await db
           .select()
           .from(schema.events)
-          .where(eq(schema.events.correlationId, params.correlationId))
+          .where(and(...conditions))
           .orderBy(
             sortOrder === 'asc'
               ? asc(schema.events.eventId)
@@ -616,7 +805,7 @@ export function createStorage(config: StorageConfig): Storage {
         const hasMore = result.length > limit;
         const rows = result.slice(0, limit);
         const data = rows.map((row) => toEvent(row));
-        const nextCursor = hasMore ? data[data.length - 1]?.eventId : null;
+        const nextCursor = data.at(-1)?.eventId ?? null;
 
         return {
           data: data.map((e) => filterEventData(e, params.resolveData)),
@@ -629,11 +818,46 @@ export function createStorage(config: StorageConfig): Storage {
     hooks: {
       async create(
         runId: string,
-        data: CreateHookRequest & { specVersion?: number },
+        data: CreateHookRequest & {
+          specVersion?: number;
+          isSystem?: boolean;
+          tokenRetentionUntil?: Date;
+          resumeContext?: Hook['resumeContext'];
+        },
         params?: ResolveDataParams
       ): Promise<Hook> {
         const now = new Date();
         const nowStr = now.toISOString();
+
+        const [staleHook] = await db
+          .select({ hookId: schema.hooks.hookId })
+          .from(schema.hooks)
+          .where(
+            and(
+              eq(schema.hooks.token, data.token),
+              exists(
+                db
+                  .select({ runId: schema.runs.runId })
+                  .from(schema.runs)
+                  .where(
+                    and(
+                      eq(schema.runs.runId, schema.hooks.runId),
+                      inArray(schema.runs.status, terminalRunStatuses)
+                    )
+                  )
+              ),
+              or(
+                isNull(schema.hooks.tokenRetentionUntil),
+                lte(schema.hooks.tokenRetentionUntil, nowStr)
+              )
+            )
+          )
+          .limit(1);
+        if (staleHook) {
+          await db
+            .delete(schema.hooks)
+            .where(eq(schema.hooks.hookId, staleHook.hookId));
+        }
 
         try {
           await db.insert(schema.hooks).values({
@@ -641,6 +865,10 @@ export function createStorage(config: StorageConfig): Storage {
             runId,
             token: data.token,
             metadata: data.metadata,
+            isWebhook: data.isWebhook,
+            isSystem: data.isSystem,
+            tokenRetentionUntil: toIsoString(data.tokenRetentionUntil),
+            resumeContext: data.resumeContext,
             ownerId: 'turso-owner',
             projectId: 'turso-project',
             environment: 'development',
@@ -667,6 +895,10 @@ export function createStorage(config: StorageConfig): Storage {
           hookId: data.hookId,
           token: data.token,
           metadata: data.metadata,
+          isWebhook: data.isWebhook,
+          isSystem: data.isSystem,
+          tokenRetentionUntil: data.tokenRetentionUntil,
+          resumeContext: data.resumeContext,
           ownerId: 'turso-owner',
           projectId: 'turso-project',
           environment: 'development',
@@ -681,11 +913,16 @@ export function createStorage(config: StorageConfig): Storage {
         const result = await db
           .select()
           .from(schema.hooks)
-          .where(eq(schema.hooks.hookId, hookId))
+          .where(
+            and(
+              eq(schema.hooks.hookId, hookId),
+              availableHookAt(new Date().toISOString())
+            )
+          )
           .limit(1);
 
         if (result.length === 0) {
-          throw new WorkflowAPIError(`Hook not found: ${hookId}`, { status: 404 });
+          throw new HookNotFoundError(hookId);
         }
 
         const hook = toHook(result[0]);
@@ -696,13 +933,16 @@ export function createStorage(config: StorageConfig): Storage {
         const result = await db
           .select()
           .from(schema.hooks)
-          .where(eq(schema.hooks.token, token))
+          .where(
+            and(
+              eq(schema.hooks.token, token),
+              availableHookAt(new Date().toISOString())
+            )
+          )
           .limit(1);
 
         if (result.length === 0) {
-          throw new WorkflowAPIError(`Hook not found for token: ${token}`, {
-            status: 404,
-          });
+          throw new HookNotFoundError(token);
         }
 
         const hook = toHook(result[0]);
@@ -713,14 +953,19 @@ export function createStorage(config: StorageConfig): Storage {
         const limit = params.pagination?.limit ?? 100;
 
         let result;
+        const available = availableHookAt(new Date().toISOString());
         if (params.runId) {
           result = await db
             .select()
             .from(schema.hooks)
-            .where(eq(schema.hooks.runId, params.runId))
+            .where(and(eq(schema.hooks.runId, params.runId), available))
             .limit(limit + 1);
         } else {
-          result = await db.select().from(schema.hooks).limit(limit + 1);
+          result = await db
+            .select()
+            .from(schema.hooks)
+            .where(available)
+            .limit(limit + 1);
         }
 
         const hasMore = result.length > limit;
@@ -751,6 +996,55 @@ export function createStorage(config: StorageConfig): Storage {
     params?: CreateEventParams
   ) => Promise<Event>;
 
+  async function appendEventToActiveRun(
+    runId: string,
+    data: AnyEventRequest,
+    params?: CreateEventParams
+  ): Promise<Event> {
+    const eventId = `evnt_${generateUlid()}`;
+    const now = new Date();
+    const result = await config.client.execute({
+      sql: `INSERT INTO workflow_events (
+              event_id, run_id, type, correlation_id, payload,
+              created_at, occurred_at, resume_id
+            )
+            SELECT ?, run_id, ?, ?, ?, ?, ?, ?
+            FROM workflow_runs
+            WHERE run_id = ?
+              AND status NOT IN ('completed', 'failed', 'cancelled')
+            RETURNING event_id`,
+      args: [
+        eventId,
+        data.eventType,
+        data.correlationId ?? null,
+        Buffer.from(encode(data)),
+        now.toISOString(),
+        toIsoString(params?.occurredAt),
+        params?.resumeId ?? null,
+        runId,
+      ],
+    });
+
+    if (result.rows.length === 0) {
+      const run = await legacyStorage.runs.get(runId, { resolveData: 'none' });
+      throw new RunExpiredError(
+        `Workflow run "${runId}" is already in terminal state "${run.status}"`
+      );
+    }
+
+    return filterEventData(
+      {
+        ...data,
+        runId,
+        eventId,
+        createdAt: now,
+        occurredAt: params?.occurredAt,
+        resumeId: params?.resumeId,
+      } as Event,
+      params?.resolveData
+    );
+  }
+
   async function handleLegacyEvent(
     runId: string,
     data: AnyEventRequest,
@@ -768,12 +1062,17 @@ export function createStorage(config: StorageConfig): Storage {
       return { event: undefined, run: filterRunData(run, resolveData) };
     }
 
-    if (data.eventType === 'wait_completed' || data.eventType === 'hook_received') {
-      const event = await appendEvent(
+    if (data.eventType === 'hook_received') {
+      const event = await appendEventToActiveRun(
         runId,
         { ...data, specVersion: SPEC_VERSION_CURRENT } as AnyEventRequest,
         params
       );
+      return { event: filterEventData(event, resolveData) };
+    }
+
+    if (data.eventType === 'wait_completed') {
+      const event = await appendEvent(runId, data, params);
       return { event: filterEventData(event, resolveData) };
     }
 
@@ -794,7 +1093,7 @@ export function createStorage(config: StorageConfig): Storage {
     },
 
     steps: {
-      async get(runId: string | undefined, stepId: string, params?: any) {
+      async get(runId: string, stepId: string, params?: any) {
         return legacyStorage.steps.get(runId, stepId, params);
       },
       async list(params: any) {
@@ -808,12 +1107,23 @@ export function createStorage(config: StorageConfig): Storage {
         const specVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
 
         if (data.eventType === 'run_created') {
+          validateAttributeChanges(
+            Object.entries(data.eventData.attributes ?? {}).map(
+              ([key, value]) => ({ key, value })
+            ),
+            {
+              allowReservedAttributes:
+                data.eventData.allowReservedAttributes === true,
+            }
+          );
           const run = await legacyStorage.runs.create({
             runId: runId ?? undefined,
             deploymentId: data.eventData.deploymentId,
             workflowName: data.eventData.workflowName,
             input: data.eventData.input,
             executionContext: data.eventData.executionContext,
+            attributes: data.eventData.attributes,
+            encryptionPublicKey: data.eventData.encryptionPublicKey,
             specVersion,
           });
 
@@ -835,9 +1145,58 @@ export function createStorage(config: StorageConfig): Storage {
           });
         }
 
-        const currentRun = await legacyStorage.runs.get(runId, {
-          resolveData: 'all',
-        });
+        let currentRun: WorkflowRun;
+        try {
+          currentRun = await legacyStorage.runs.get(runId, {
+            resolveData: 'all',
+          });
+        } catch (error) {
+          const runInput =
+            data.eventType === 'run_started' ? data.eventData : undefined;
+          if (
+            !WorkflowRunNotFoundError.is(error) ||
+            !runInput?.deploymentId ||
+            !runInput.workflowName ||
+            runInput.input === undefined
+          ) {
+            throw error;
+          }
+
+          validateAttributeChanges(
+            Object.entries(runInput.attributes ?? {}).map(([key, value]) => ({
+              key,
+              value,
+            })),
+            {
+              allowReservedAttributes:
+                runInput.allowReservedAttributes === true,
+            }
+          );
+          currentRun = await legacyStorage.runs.create({
+            runId,
+            deploymentId: runInput.deploymentId,
+            workflowName: runInput.workflowName,
+            input: runInput.input,
+            executionContext: runInput.executionContext,
+            attributes: runInput.attributes,
+            encryptionPublicKey: runInput.encryptionPublicKey,
+            specVersion,
+          });
+          await appendEvent(
+            runId,
+            {
+              eventType: 'run_created',
+              eventData: {
+                ...runInput,
+                deploymentId: runInput.deploymentId,
+                workflowName: runInput.workflowName,
+                input: runInput.input,
+              },
+              specVersion,
+            },
+            params
+          );
+        }
 
         if (requiresNewerWorld(currentRun.specVersion)) {
           throw new RunNotSupportedError(
@@ -848,6 +1207,12 @@ export function createStorage(config: StorageConfig): Storage {
 
         if (isLegacySpecVersion(currentRun.specVersion)) {
           return handleLegacyEvent(runId, data, currentRun, params);
+        }
+
+        if (data.eventType === 'run_started' && currentRun.status === 'running') {
+          return {
+            run: filterRunData(currentRun, resolveData),
+          };
         }
 
         if (isTerminalRunStatus(currentRun.status)) {
@@ -877,15 +1242,25 @@ export function createStorage(config: StorageConfig): Storage {
             );
           }
 
-          if (data.eventType === 'step_created' || data.eventType === 'hook_created') {
+          if (isChildEntityCreationEvent(data)) {
             throw new WorkflowAPIError(
               `Cannot create entities on terminal run '${currentRun.status}'`,
+              { status: 409 }
+            );
+          }
+          if (data.eventType === 'attr_set') {
+            throw new WorkflowAPIError(
+              `Cannot set attributes on terminal run '${currentRun.status}'`,
               { status: 409 }
             );
           }
         }
 
         let validatedStep: Step | undefined;
+        const lazyStepStart =
+          data.eventType === 'step_started' &&
+          typeof data.eventData?.stepName === 'string' &&
+          data.eventData.input !== undefined;
         const stepEvents = new Set([
           'step_started',
           'step_completed',
@@ -900,18 +1275,41 @@ export function createStorage(config: StorageConfig): Storage {
             });
           }
 
-          validatedStep = await legacyStorage.steps.get(runId, data.correlationId, {
-            resolveData: 'all',
-          });
+          try {
+            validatedStep = await legacyStorage.steps.get(
+              runId,
+              data.correlationId,
+              { resolveData: 'all' }
+            );
+          } catch (error) {
+            if (
+              !lazyStepStart ||
+              !(error instanceof WorkflowAPIError) ||
+              error.status !== 404
+            ) {
+              throw error;
+            }
+          }
 
-          if (isTerminalStepStatus(validatedStep.status)) {
+          if (lazyStepStart && validatedStep) {
+            throw new WorkflowAPIError(
+              `Step '${data.correlationId}' already exists`,
+              { status: 409 }
+            );
+          }
+
+          if (validatedStep && isTerminalStepStatus(validatedStep.status)) {
             throw new WorkflowAPIError(
               `Cannot modify step in terminal state '${validatedStep.status}'`,
               { status: 409 }
             );
           }
 
-          if (isTerminalRunStatus(currentRun.status) && validatedStep.status !== 'running') {
+          if (
+            validatedStep &&
+            isTerminalRunStatus(currentRun.status) &&
+            validatedStep.status !== 'running'
+          ) {
             throw new WorkflowAPIError(
               `Cannot modify non-running step on terminal run '${currentRun.status}'`,
               { status: 410 }
@@ -926,9 +1324,20 @@ export function createStorage(config: StorageConfig): Storage {
           await legacyStorage.hooks.get(data.correlationId, { resolveData: 'all' });
         }
 
+        if (data.eventType === 'hook_received') {
+          const event = await appendEventToActiveRun(
+            runId,
+            { ...data, specVersion } as AnyEventRequest,
+            params
+          );
+          return { event: filterEventData(event, resolveData) };
+        }
+
         let run: WorkflowRun | undefined;
         let step: Step | undefined;
         let hook: Hook | undefined;
+        let wait: Wait | undefined;
+        let stepCreatedLazily = false;
 
         switch (data.eventType) {
           case 'run_started':
@@ -944,18 +1353,11 @@ export function createStorage(config: StorageConfig): Storage {
             run.specVersion = currentRun.specVersion;
             break;
           case 'run_failed': {
-            const message =
-              typeof data.eventData.error === 'string'
-                ? data.eventData.error
-                : (data.eventData.error?.message ?? 'Unknown error');
             run = await legacyStorage.runs.update(runId, {
               status: 'failed',
               output: undefined,
-              error: {
-                message,
-                stack: data.eventData.error?.stack,
-                code: data.eventData.errorCode,
-              },
+              error: data.eventData.error,
+              errorCode: data.eventData.errorCode,
             });
             run.specVersion = currentRun.specVersion;
             break;
@@ -968,6 +1370,15 @@ export function createStorage(config: StorageConfig): Storage {
             });
             run.specVersion = currentRun.specVersion;
             break;
+          case 'attr_set': {
+            run = await legacyStorage.runs.updateAttributes(
+              runId,
+              data.eventData.changes,
+              data.eventData.allowReservedAttributes === true
+            );
+            run.specVersion = currentRun.specVersion;
+            break;
+          }
           case 'step_created': {
             const stepId = data.correlationId;
             if (!stepId) {
@@ -1003,11 +1414,39 @@ export function createStorage(config: StorageConfig): Storage {
           }
           case 'step_started': {
             const stepId = data.correlationId;
-            if (!stepId || !validatedStep) {
+            if (!stepId) {
               throw new WorkflowAPIError(
                 'correlationId is required for step_started',
                 { status: 400 }
               );
+            }
+            if (!validatedStep && lazyStepStart) {
+              const lazyData = data.eventData;
+              validatedStep = await legacyStorage.steps.create(runId, {
+                stepId,
+                stepName: lazyData?.stepName ?? '',
+                input: lazyData?.input,
+                specVersion,
+              });
+              await appendEvent(
+                runId,
+                {
+                  eventType: 'step_created',
+                  correlationId: stepId,
+                  eventData: {
+                    stepName: lazyData?.stepName ?? '',
+                    input: lazyData?.input,
+                  },
+                  specVersion,
+                },
+                params
+              );
+              stepCreatedLazily = true;
+            }
+            if (!validatedStep) {
+              throw new WorkflowAPIError(`Step '${stepId}' not found`, {
+                status: 404,
+              });
             }
             if (validatedStep.retryAfter && validatedStep.retryAfter.getTime() > Date.now()) {
               const err = new WorkflowAPIError(
@@ -1022,7 +1461,7 @@ export function createStorage(config: StorageConfig): Storage {
             }
             step = await legacyStorage.steps.update(runId, stepId, {
               status: 'running',
-              attempt: validatedStep.attempt + 1,
+              attempt: data.eventData?.attempt ?? validatedStep.attempt + 1,
               retryAfter: undefined,
             });
             break;
@@ -1050,17 +1489,10 @@ export function createStorage(config: StorageConfig): Storage {
                 { status: 400 }
               );
             }
-            const message =
-              typeof data.eventData.error === 'string'
-                ? data.eventData.error
-                : (data.eventData.error?.message ?? 'Unknown error');
             step = await legacyStorage.steps.update(runId, stepId, {
               status: 'failed',
               output: undefined,
-              error: {
-                message,
-                stack: data.eventData.stack,
-              },
+              error: data.eventData.error,
             });
             break;
           }
@@ -1072,16 +1504,9 @@ export function createStorage(config: StorageConfig): Storage {
                 { status: 400 }
               );
             }
-            const message =
-              typeof data.eventData.error === 'string'
-                ? data.eventData.error
-                : (data.eventData.error?.message ?? 'Unknown error');
             step = await legacyStorage.steps.update(runId, stepId, {
               status: 'pending',
-              error: {
-                message,
-                stack: data.eventData.stack,
-              },
+              error: data.eventData.error,
               retryAfter: data.eventData.retryAfter,
             });
             break;
@@ -1101,6 +1526,25 @@ export function createStorage(config: StorageConfig): Storage {
                   hookId,
                   token: data.eventData.token,
                   metadata: data.eventData.metadata,
+                  isWebhook: data.eventData.isWebhook,
+                  isSystem: data.eventData.isSystem,
+                  tokenRetentionUntil: data.eventData.tokenRetentionUntil,
+                  resumeContext: {
+                    deploymentId: currentRun.deploymentId,
+                    workflowName: currentRun.workflowName,
+                    runSpecVersion: currentRun.specVersion,
+                    encryptionPublicKey: currentRun.encryptionPublicKey,
+                    workflowCoreVersion:
+                      typeof currentRun.executionContext?.workflowCoreVersion ===
+                      'string'
+                        ? currentRun.executionContext.workflowCoreVersion
+                        : undefined,
+                    hookResumeInputVersion:
+                      typeof currentRun.executionContext?.hookResumeInputVersion ===
+                      'number'
+                        ? currentRun.executionContext.hookResumeInputVersion
+                        : undefined,
+                  },
                   specVersion,
                 },
                 params
@@ -1110,12 +1554,27 @@ export function createStorage(config: StorageConfig): Storage {
                 error instanceof WorkflowAPIError &&
                 (error as { status?: number }).status === 409
               ) {
+                const conflictingHook = await legacyStorage.hooks.getByToken(
+                  data.eventData.token,
+                  { resolveData: 'none' }
+                );
+                if (
+                  conflictingHook.runId === runId &&
+                  conflictingHook.hookId === hookId
+                ) {
+                  throw new EntityConflictError(
+                    `Hook '${hookId}' already exists`
+                  );
+                }
                 const conflictEvent = await appendEvent(
                   runId,
                   {
                     eventType: 'hook_conflict',
                     correlationId: hookId,
-                    eventData: { token: data.eventData.token },
+                    eventData: {
+                      token: data.eventData.token,
+                      conflictingRunId: conflictingHook.runId,
+                    },
                     specVersion,
                   } as unknown as AnyEventRequest,
                   params
@@ -1137,10 +1596,87 @@ export function createStorage(config: StorageConfig): Storage {
             hook = await legacyStorage.hooks.dispose(hookId, params);
             break;
           }
-          case 'hook_received':
-          case 'wait_created':
-          case 'wait_completed':
+          case 'wait_created': {
+            const waitCorrelationId = data.correlationId;
+            if (!waitCorrelationId) {
+              throw new WorkflowAPIError(
+                'correlationId is required for wait_created',
+                { status: 400 }
+              );
+            }
+            const now = new Date();
+            const waitId = `${runId}-${waitCorrelationId}`;
+            try {
+              await db.insert(schema.waits).values({
+                waitId,
+                runId,
+                status: 'waiting',
+                resumeAt: toIsoString(data.eventData.resumeAt),
+                createdAt: now.toISOString(),
+                updatedAt: now.toISOString(),
+                specVersion,
+              });
+            } catch (error) {
+              throw new WorkflowAPIError(
+                `Wait '${waitCorrelationId}' already exists`,
+                { status: 409, cause: error }
+              );
+            }
+            wait = toWait(
+              (
+                await db
+                  .select()
+                  .from(schema.waits)
+                  .where(eq(schema.waits.waitId, waitId))
+                  .limit(1)
+              )[0]
+            );
             break;
+          }
+          case 'wait_completed': {
+            const waitCorrelationId = data.correlationId;
+            if (!waitCorrelationId) {
+              throw new WorkflowAPIError(
+                'correlationId is required for wait_completed',
+                { status: 400 }
+              );
+            }
+            const waitId = `${runId}-${waitCorrelationId}`;
+            const now = new Date();
+            const existing = (
+              await db
+                .select()
+                .from(schema.waits)
+                .where(eq(schema.waits.waitId, waitId))
+                .limit(1)
+            )[0];
+            if (!existing) {
+              throw new WorkflowAPIError(`Wait '${waitCorrelationId}' not found`, {
+                status: 404,
+              });
+            }
+            if (existing.status === 'completed') {
+              throw new WorkflowAPIError(
+                `Wait '${waitCorrelationId}' already completed`,
+                { status: 409 }
+              );
+            }
+            await db
+              .update(schema.waits)
+              .set({
+                status: 'completed',
+                completedAt: now.toISOString(),
+                updatedAt: now.toISOString(),
+              })
+              .where(eq(schema.waits.waitId, waitId));
+            wait = toWait({
+              ...existing,
+              status: 'completed',
+              completedAt: now.toISOString(),
+              updatedAt: now.toISOString(),
+            });
+            break;
+          }
           default:
             throw new WorkflowAPIError(
               `Unsupported event type: ${(data as { eventType: string }).eventType}`,
@@ -1148,9 +1684,22 @@ export function createStorage(config: StorageConfig): Storage {
             );
         }
 
+        let storedData: AnyEventRequest = { ...data, specVersion } as AnyEventRequest;
+        if (data.eventType === 'run_started') {
+          const { eventData: _eventData, ...runStarted } = storedData;
+          storedData = runStarted as AnyEventRequest;
+        } else if (data.eventType === 'step_started' && data.eventData) {
+          const { input: _input, ...stepStartedData } = data.eventData;
+          storedData = {
+            ...data,
+            eventData: stepStartedData,
+            specVersion,
+          } as AnyEventRequest;
+        }
+
         const event = await appendEvent(
           runId,
-          { ...data, specVersion } as AnyEventRequest,
+          storedData,
           params
         );
 
@@ -1159,11 +1708,17 @@ export function createStorage(config: StorageConfig): Storage {
           run: run ? filterRunData(run, resolveData) : undefined,
           step: step ? filterStepData(step, resolveData) : undefined,
           hook: hook ? filterHookData(hook, resolveData) : undefined,
+          wait,
+          ...(stepCreatedLazily ? { stepCreated: true } : {}),
         };
       },
 
       async list(params: any) {
         return legacyStorage.events.list(params);
+      },
+
+      async get(runId: string, eventId: string, params?: any) {
+        return legacyStorage.events.get(runId, eventId, params);
       },
 
       async listByCorrelationId(params: any) {

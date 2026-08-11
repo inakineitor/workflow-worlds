@@ -62,14 +62,18 @@ export const runs = sqliteTable(
     status: text('status').notNull().default('pending'),
 
     // CBOR columns for type-preserving storage
-    input: Cbor<unknown[]>()('input'),
+    input: Cbor<unknown>()('input'),
     output: Cbor<unknown>()('output'),
-    error: Cbor<{ message: string; stack?: string; code?: string }>()('error'),
+    error: Cbor<unknown>()('error'),
+    errorCode: text('error_code'),
     executionContext: Cbor<Record<string, unknown>>()('execution_context'),
+    attributes: Cbor<Record<string, string>>()('attributes'),
+    encryptionPublicKey: text('encryption_public_key'),
 
     // Timestamps as TEXT (ISO strings) - SQLite doesn't have native timestamp
     startedAt: text('started_at'),
     completedAt: text('completed_at'),
+    expiredAt: text('expired_at'),
     createdAt: text('created_at').notNull(),
     updatedAt: text('updated_at').notNull(),
   },
@@ -93,7 +97,7 @@ export const steps = sqliteTable(
     stepName: text('step_name'),
     status: text('status').notNull().default('pending'),
 
-    input: Cbor<unknown[]>()('input'),
+    input: Cbor<unknown>()('input'),
     output: Cbor<unknown>()('output'),
     error: Cbor<unknown>()('error'),
 
@@ -127,6 +131,8 @@ export const events = sqliteTable(
     payload: Cbor<Record<string, unknown>>()('payload'),
 
     createdAt: text('created_at').notNull(),
+    occurredAt: text('occurred_at'),
+    resumeId: text('resume_id'),
   },
   (table) => [
     index('idx_events_run').on(table.runId, table.eventId),
@@ -146,6 +152,10 @@ export const hooks = sqliteTable(
     token: text('token').notNull(),
     displayName: text('display_name'),
     metadata: Cbor<unknown>()('metadata'),
+    isWebhook: integer('is_webhook', { mode: 'boolean' }),
+    isSystem: integer('is_system', { mode: 'boolean' }),
+    tokenRetentionUntil: text('token_retention_until'),
+    resumeContext: Cbor<Record<string, unknown>>()('resume_context'),
     ownerId: text('owner_id').notNull(),
     projectId: text('project_id').notNull(),
     environment: text('environment').notNull(),
@@ -178,7 +188,10 @@ export const queueMessages = sqliteTable(
     attempt: integer('attempt').default(0),
     maxAttempts: integer('max_attempts').default(3),
     notBefore: text('not_before'),
+    headers: Cbor<Record<string, string>>()('headers'),
+    leaseUntil: text('lease_until'),
     createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at'),
     processedAt: text('processed_at'),
   },
   (table) => [
@@ -229,4 +242,62 @@ export const streamRuns = sqliteTable(
     primaryKey({ columns: [table.runId, table.streamName] }),
     index('idx_stream_runs_run').on(table.runId),
   ]
+);
+
+// =============================================================================
+// Workflow v5 Streams
+// =============================================================================
+
+export const streams = sqliteTable(
+  'workflow_streams',
+  {
+    runId: text('run_id').notNull(),
+    streamName: text('stream_name').notNull(),
+    tailIndex: integer('tail_index').notNull().default(-1),
+    done: integer('done', { mode: 'boolean' }).notNull().default(false),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.runId, table.streamName] }),
+    index('idx_workflow_streams_run').on(table.runId, table.streamName),
+  ]
+);
+
+export const workflowStreamChunks = sqliteTable(
+  'workflow_stream_chunks',
+  {
+    runId: text('run_id').notNull(),
+    streamName: text('stream_name').notNull(),
+    chunkIndex: integer('chunk_index').notNull(),
+    data: blob('data', { mode: 'buffer' }).notNull(),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.runId, table.streamName, table.chunkIndex] }),
+    index('idx_workflow_stream_chunks').on(
+      table.runId,
+      table.streamName,
+      table.chunkIndex
+    ),
+  ]
+);
+
+// =============================================================================
+// Workflow Waits
+// =============================================================================
+
+export const waits = sqliteTable(
+  'workflow_waits',
+  {
+    waitId: text('wait_id').primaryKey(),
+    runId: text('run_id').notNull(),
+    status: text('status').notNull().default('waiting'),
+    resumeAt: text('resume_at'),
+    completedAt: text('completed_at'),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+    specVersion: integer('spec_version'),
+  },
+  (table) => [index('idx_waits_run').on(table.runId, table.waitId)]
 );
