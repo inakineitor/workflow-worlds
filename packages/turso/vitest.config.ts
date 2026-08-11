@@ -8,10 +8,6 @@ export default defineConfig({
     setupFiles: ['test/setup.ts'],
     // Run tests sequentially to share the database
     pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-      },
-    },
+    fileParallelism: false,
   },
 });
