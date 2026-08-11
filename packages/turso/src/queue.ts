@@ -93,6 +93,7 @@ export function createQueue(config: QueueConfig): TursoQueue {
   let running = false;
   let closing = false;
   let pollPromise: Promise<void> | undefined;
+  let pollController: AbortController | undefined;
   let resolvedBaseUrl: Promise<string> | undefined;
 
   async function getExecutionBaseUrl(): Promise<string> {
@@ -294,7 +295,16 @@ export function createQueue(config: QueueConfig): TursoQueue {
       }
 
       if (!claimed) {
-        await sleep(pollIntervalMs, undefined, { ref: false });
+        try {
+          await sleep(pollIntervalMs, undefined, {
+            ref: false,
+            signal: pollController?.signal,
+          });
+        } catch (error) {
+          if (!pollController?.signal.aborted) {
+            throw error;
+          }
+        }
       }
     }
   }
@@ -407,6 +417,7 @@ export function createQueue(config: QueueConfig): TursoQueue {
       }
       closing = false;
       running = true;
+      pollController = new AbortController();
       pollPromise = poll();
     },
     async close() {
@@ -415,9 +426,12 @@ export function createQueue(config: QueueConfig): TursoQueue {
       }
       closing = true;
       running = false;
+      pollController?.abort();
       await pollPromise;
       await Promise.allSettled(inFlight);
       inFlight.clear();
+      pollController = undefined;
+      pollPromise = undefined;
     },
   };
 }
