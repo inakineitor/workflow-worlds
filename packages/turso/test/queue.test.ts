@@ -18,6 +18,26 @@ afterEach(async () => {
 });
 
 describe('persistent queue', () => {
+  it('wakes an idle poller during shutdown', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'workflow-turso-close-'));
+    directories.push(directory);
+    const databaseUrl = `file:${join(directory, 'workflow.db')}`;
+    await migrateDatabase({ databaseUrl });
+    const client = createClient({ url: databaseUrl });
+    const queue = createQueue({ client, pollIntervalMs: 60_000 });
+    await queue.start();
+
+    const outcome = await Promise.race([
+      queue.close().then(() => 'closed' as const),
+      new Promise<'timed-out'>((resolve) =>
+        setTimeout(() => resolve('timed-out'), 250)
+      ),
+    ]);
+
+    expect(outcome).toBe('closed');
+    await client.close();
+  });
+
   it('redelivers a message whose processing lease expired', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'workflow-turso-queue-'));
     directories.push(directory);
