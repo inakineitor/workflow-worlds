@@ -1,8 +1,8 @@
 /**
  * Turso Storage Implementation
  *
- * Implements Storage using Turso/libSQL with an internal legacy mutator layer,
- * then exposes the Workflow 4.1 event-sourced public Storage surface.
+ * Implements Storage using Turso/libSQL with an internal mutator layer, then
+ * exposes the Workflow v5 event-sourced public Storage surface.
  */
 
 import type { Client } from '@libsql/client';
