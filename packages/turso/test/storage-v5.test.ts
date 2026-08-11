@@ -174,4 +174,122 @@ describe('Workflow v5 storage', () => {
     expect(incremental.cursor).toBe(incremental.data[0].eventId);
     expect(incremental.hasMore).toBe(false);
   });
+
+  it('preserves concurrent disjoint attribute writes', async () => {
+    const { storage } = await createStorage();
+    const runId = 'wrun_01KZATTRCONCURRENT0000000001';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      specVersion: 5,
+      eventData: {
+        deploymentId: 'deployment-v5',
+        workflowName: 'workflow//test//attributes',
+        input: new Uint8Array(),
+      },
+    });
+
+    await Promise.all(
+      ['a', 'b', 'c'].map((key, index) =>
+        storage.events.create(runId, {
+          eventType: 'attr_set',
+          specVersion: 5,
+          correlationId: `attr-concurrent-${key}`,
+          eventData: {
+            changes: [{ key, value: String(index + 1) }],
+            writer: { type: 'workflow' },
+          },
+        })
+      )
+    );
+
+    await expect(storage.runs.get(runId)).resolves.toMatchObject({
+      attributes: { a: '1', b: '2', c: '3' },
+    });
+  });
+
+  it('reports hook conflicts with the owning run', async () => {
+    const { storage } = await createStorage();
+    const ownerRunId = 'wrun_01KZHOOKOWNER0000000000001';
+    const contenderRunId = 'wrun_01KZHOOKCONTENDER000000001';
+    for (const runId of [ownerRunId, contenderRunId]) {
+      await storage.events.create(runId, {
+        eventType: 'run_created',
+        specVersion: 5,
+        eventData: {
+          deploymentId: 'deployment-v5',
+          workflowName: 'workflow//test//hooks',
+          input: new Uint8Array(),
+        },
+      });
+    }
+    await storage.events.create(ownerRunId, {
+      eventType: 'hook_created',
+      specVersion: 5,
+      correlationId: 'owner-hook',
+      eventData: { token: 'token-conflict-v5', isWebhook: false },
+    });
+
+    const conflict = await storage.events.create(contenderRunId, {
+      eventType: 'hook_created',
+      specVersion: 5,
+      correlationId: 'contender-hook',
+      eventData: { token: 'token-conflict-v5', isWebhook: false },
+    });
+    expect(conflict.event).toMatchObject({
+      eventType: 'hook_conflict',
+      eventData: {
+        token: 'token-conflict-v5',
+        conflictingRunId: ownerRunId,
+      },
+    });
+  });
+
+  it('retains requested hooks after terminal runs and uses typed not-found errors', async () => {
+    const { storage } = await createStorage();
+    const runId = 'wrun_01KZHOOKRETENTION00000000001';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      specVersion: 5,
+      eventData: {
+        deploymentId: 'deployment-v5',
+        workflowName: 'workflow//test//retention',
+        input: new Uint8Array(),
+      },
+    });
+    await storage.events.create(runId, {
+      eventType: 'hook_created',
+      specVersion: 5,
+      correlationId: 'retained-hook',
+      eventData: {
+        token: 'token-retained-v5',
+        isWebhook: false,
+        tokenRetentionUntil: new Date(Date.now() + 60_000),
+      },
+    });
+    await storage.events.create(runId, {
+      eventType: 'run_completed',
+      specVersion: 5,
+      eventData: { output: new Uint8Array() },
+    });
+
+    await expect(storage.hooks.getByToken('token-retained-v5')).resolves.toMatchObject({
+      runId,
+      hookId: 'retained-hook',
+    });
+    await expect(
+      storage.events.create(runId, {
+        eventType: 'hook_received',
+        specVersion: 5,
+        correlationId: 'retained-hook',
+        eventData: {
+          token: 'token-retained-v5',
+          payload: new Uint8Array(),
+        },
+      })
+    ).rejects.toMatchObject({ name: 'RunExpiredError' });
+    await expect(storage.hooks.getByToken('token-missing-v5')).rejects.toMatchObject({
+      name: 'HookNotFoundError',
+      token: 'token-missing-v5',
+    });
+  });
 });

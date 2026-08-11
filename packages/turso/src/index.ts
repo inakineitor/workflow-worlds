@@ -58,6 +58,9 @@ export function createWorld(config: TursoWorldConfig = {}): World {
 
   return {
     specVersion: SPEC_VERSION_CURRENT,
+    capabilities: {
+      hookRetention: { active: true },
+    },
     processExitTriggersQueueRedelivery: false,
     ...storage,
     ...streamer,

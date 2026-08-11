@@ -6,7 +6,11 @@
  */
 
 import type { Client } from '@libsql/client';
+import { encode } from 'cbor-x';
 import {
+  EntityConflictError,
+  HookNotFoundError,
+  RunExpiredError,
   RunNotSupportedError,
   WorkflowRunNotFoundError,
   WorkflowWorldError as WorkflowAPIError,
@@ -37,7 +41,20 @@ import {
   stripEventDataRefs,
   validateAttributeChanges,
 } from '@workflow/world';
-import { and, asc, desc, eq, gt, lt } from 'drizzle-orm';
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  exists,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  notExists,
+  or,
+} from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/libsql';
 import { monotonicFactory } from 'ulid';
 import * as schema from './drizzle/schema.js';
@@ -66,6 +83,11 @@ type LegacyStorage = {
     ): Promise<WorkflowRun>;
     get(id: string, params?: ResolveDataParams): Promise<WorkflowRun>;
     update(id: string, data: UpdateWorkflowRunRequest): Promise<WorkflowRun>;
+    updateAttributes(
+      id: string,
+      changes: Parameters<typeof applyAttributeChanges>[1],
+      allowReservedAttributes: boolean
+    ): Promise<WorkflowRun>;
     list(params?: any): Promise<PaginatedResponse<WorkflowRun>>;
   };
   steps: {
@@ -262,6 +284,24 @@ export interface StorageConfig {
 
 export function createStorage(config: StorageConfig): Storage {
   const db = drizzle(config.client, { schema });
+  const terminalRunStatuses = ['completed', 'failed', 'cancelled'];
+
+  function availableHookAt(isoTimestamp: string) {
+    const ownerRunIsTerminal = db
+      .select({ runId: schema.runs.runId })
+      .from(schema.runs)
+      .where(
+        and(
+          eq(schema.runs.runId, schema.hooks.runId),
+          inArray(schema.runs.status, terminalRunStatuses)
+        )
+      );
+
+    return or(
+      gt(schema.hooks.tokenRetentionUntil, isoTimestamp),
+      notExists(ownerRunIsTerminal)
+    );
+  }
 
   async function setRunSpecVersion(runId: string, specVersion: number): Promise<void> {
     await config.client.execute({
@@ -352,48 +392,116 @@ export function createStorage(config: StorageConfig): Storage {
       },
 
       async update(id: string, data: UpdateWorkflowRunRequest): Promise<WorkflowRun> {
-        const existing = await this.get(id, { resolveData: 'all' });
-        const now = new Date();
-        const nowStr = now.toISOString();
+        while (true) {
+          const existing = await this.get(id, { resolveData: 'all' });
+          const now = new Date(
+            Math.max(Date.now(), existing.updatedAt.getTime() + 1)
+          );
+          const nowStr = now.toISOString();
 
-        const updated: WorkflowRun = {
-          ...existing,
-          ...data,
-          updatedAt: now,
-        } as WorkflowRun;
+          const updated: WorkflowRun = {
+            ...existing,
+            ...data,
+            updatedAt: now,
+          } as WorkflowRun;
 
-        if (data.status === 'running' && !updated.startedAt) {
-          updated.startedAt = now;
+          if (data.status === 'running' && !updated.startedAt) {
+            updated.startedAt = now;
+          }
+
+          const isTerminal =
+            data.status === 'completed' ||
+            data.status === 'failed' ||
+            data.status === 'cancelled';
+
+          if (isTerminal) {
+            updated.completedAt = now;
+          }
+
+          const [updatedRow] = await db
+            .update(schema.runs)
+            .set({
+              status: updated.status,
+              input: updated.input,
+              output: updated.output,
+              error: updated.error,
+              errorCode: updated.errorCode,
+              executionContext: updated.executionContext,
+              attributes: updated.attributes,
+              startedAt: toIsoString(updated.startedAt),
+              completedAt: toIsoString(updated.completedAt),
+              updatedAt: nowStr,
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, id),
+                eq(schema.runs.updatedAt, existing.updatedAt.toISOString())
+              )
+            )
+            .returning();
+
+          if (!updatedRow) {
+            continue;
+          }
+
+          if (isTerminal) {
+            await Promise.all([
+              db
+                .delete(schema.hooks)
+                .where(
+                  and(
+                    eq(schema.hooks.runId, id),
+                    or(
+                      isNull(schema.hooks.tokenRetentionUntil),
+                      lte(schema.hooks.tokenRetentionUntil, nowStr)
+                    )
+                  )
+                ),
+              db.delete(schema.waits).where(eq(schema.waits.runId, id)),
+            ]);
+          }
+
+          return toWorkflowRun(
+            updatedRow,
+            await getRunSpecVersion(id)
+          );
         }
+      },
 
-        const isTerminal =
-          data.status === 'completed' ||
-          data.status === 'failed' ||
-          data.status === 'cancelled';
-
-        if (isTerminal) {
-          updated.completedAt = now;
-          await db.delete(schema.hooks).where(eq(schema.hooks.runId, id));
-          await db.delete(schema.waits).where(eq(schema.waits.runId, id));
+      async updateAttributes(
+        id: string,
+        changes: Parameters<typeof applyAttributeChanges>[1],
+        allowReservedAttributes: boolean
+      ): Promise<WorkflowRun> {
+        while (true) {
+          const existing = await this.get(id, { resolveData: 'all' });
+          validateAttributeChanges(changes, {
+            existingKeys: Object.keys(existing.attributes),
+            allowReservedAttributes,
+          });
+          const now = new Date(
+            Math.max(Date.now(), existing.updatedAt.getTime() + 1)
+          );
+          const [updatedRow] = await db
+            .update(schema.runs)
+            .set({
+              attributes: applyAttributeChanges(existing.attributes, changes),
+              updatedAt: now.toISOString(),
+            })
+            .where(
+              and(
+                eq(schema.runs.runId, id),
+                eq(schema.runs.updatedAt, existing.updatedAt.toISOString())
+              )
+            )
+            .returning();
+          if (updatedRow) {
+            return toWorkflowRun(
+              updatedRow,
+              await getRunSpecVersion(id)
+            );
+          }
         }
-
-        await db
-          .update(schema.runs)
-          .set({
-            status: updated.status,
-            input: updated.input,
-            output: updated.output,
-            error: updated.error,
-            errorCode: updated.errorCode,
-            executionContext: updated.executionContext,
-            attributes: updated.attributes,
-            startedAt: toIsoString(updated.startedAt),
-            completedAt: toIsoString(updated.completedAt),
-            updatedAt: nowStr,
-          })
-          .where(eq(schema.runs.runId, id));
-
-        return updated;
       },
 
       async list(params?: any): Promise<PaginatedResponse<WorkflowRun>> {
@@ -721,6 +829,36 @@ export function createStorage(config: StorageConfig): Storage {
         const now = new Date();
         const nowStr = now.toISOString();
 
+        const [staleHook] = await db
+          .select({ hookId: schema.hooks.hookId })
+          .from(schema.hooks)
+          .where(
+            and(
+              eq(schema.hooks.token, data.token),
+              exists(
+                db
+                  .select({ runId: schema.runs.runId })
+                  .from(schema.runs)
+                  .where(
+                    and(
+                      eq(schema.runs.runId, schema.hooks.runId),
+                      inArray(schema.runs.status, terminalRunStatuses)
+                    )
+                  )
+              ),
+              or(
+                isNull(schema.hooks.tokenRetentionUntil),
+                lte(schema.hooks.tokenRetentionUntil, nowStr)
+              )
+            )
+          )
+          .limit(1);
+        if (staleHook) {
+          await db
+            .delete(schema.hooks)
+            .where(eq(schema.hooks.hookId, staleHook.hookId));
+        }
+
         try {
           await db.insert(schema.hooks).values({
             hookId: data.hookId,
@@ -775,11 +913,16 @@ export function createStorage(config: StorageConfig): Storage {
         const result = await db
           .select()
           .from(schema.hooks)
-          .where(eq(schema.hooks.hookId, hookId))
+          .where(
+            and(
+              eq(schema.hooks.hookId, hookId),
+              availableHookAt(new Date().toISOString())
+            )
+          )
           .limit(1);
 
         if (result.length === 0) {
-          throw new WorkflowAPIError(`Hook not found: ${hookId}`, { status: 404 });
+          throw new HookNotFoundError(hookId);
         }
 
         const hook = toHook(result[0]);
@@ -790,13 +933,16 @@ export function createStorage(config: StorageConfig): Storage {
         const result = await db
           .select()
           .from(schema.hooks)
-          .where(eq(schema.hooks.token, token))
+          .where(
+            and(
+              eq(schema.hooks.token, token),
+              availableHookAt(new Date().toISOString())
+            )
+          )
           .limit(1);
 
         if (result.length === 0) {
-          throw new WorkflowAPIError(`Hook not found for token: ${token}`, {
-            status: 404,
-          });
+          throw new HookNotFoundError(token);
         }
 
         const hook = toHook(result[0]);
@@ -807,14 +953,19 @@ export function createStorage(config: StorageConfig): Storage {
         const limit = params.pagination?.limit ?? 100;
 
         let result;
+        const available = availableHookAt(new Date().toISOString());
         if (params.runId) {
           result = await db
             .select()
             .from(schema.hooks)
-            .where(eq(schema.hooks.runId, params.runId))
+            .where(and(eq(schema.hooks.runId, params.runId), available))
             .limit(limit + 1);
         } else {
-          result = await db.select().from(schema.hooks).limit(limit + 1);
+          result = await db
+            .select()
+            .from(schema.hooks)
+            .where(available)
+            .limit(limit + 1);
         }
 
         const hasMore = result.length > limit;
@@ -845,6 +996,55 @@ export function createStorage(config: StorageConfig): Storage {
     params?: CreateEventParams
   ) => Promise<Event>;
 
+  async function appendEventToActiveRun(
+    runId: string,
+    data: AnyEventRequest,
+    params?: CreateEventParams
+  ): Promise<Event> {
+    const eventId = `evnt_${generateUlid()}`;
+    const now = new Date();
+    const result = await config.client.execute({
+      sql: `INSERT INTO workflow_events (
+              event_id, run_id, type, correlation_id, payload,
+              created_at, occurred_at, resume_id
+            )
+            SELECT ?, run_id, ?, ?, ?, ?, ?, ?
+            FROM workflow_runs
+            WHERE run_id = ?
+              AND status NOT IN ('completed', 'failed', 'cancelled')
+            RETURNING event_id`,
+      args: [
+        eventId,
+        data.eventType,
+        data.correlationId ?? null,
+        Buffer.from(encode(data)),
+        now.toISOString(),
+        toIsoString(params?.occurredAt),
+        params?.resumeId ?? null,
+        runId,
+      ],
+    });
+
+    if (result.rows.length === 0) {
+      const run = await legacyStorage.runs.get(runId, { resolveData: 'none' });
+      throw new RunExpiredError(
+        `Workflow run "${runId}" is already in terminal state "${run.status}"`
+      );
+    }
+
+    return filterEventData(
+      {
+        ...data,
+        runId,
+        eventId,
+        createdAt: now,
+        occurredAt: params?.occurredAt,
+        resumeId: params?.resumeId,
+      } as Event,
+      params?.resolveData
+    );
+  }
+
   async function handleLegacyEvent(
     runId: string,
     data: AnyEventRequest,
@@ -862,12 +1062,17 @@ export function createStorage(config: StorageConfig): Storage {
       return { event: undefined, run: filterRunData(run, resolveData) };
     }
 
-    if (data.eventType === 'wait_completed' || data.eventType === 'hook_received') {
-      const event = await appendEvent(
+    if (data.eventType === 'hook_received') {
+      const event = await appendEventToActiveRun(
         runId,
         { ...data, specVersion: SPEC_VERSION_CURRENT } as AnyEventRequest,
         params
       );
+      return { event: filterEventData(event, resolveData) };
+    }
+
+    if (data.eventType === 'wait_completed') {
+      const event = await appendEvent(runId, data, params);
       return { event: filterEventData(event, resolveData) };
     }
 
@@ -1119,6 +1324,15 @@ export function createStorage(config: StorageConfig): Storage {
           await legacyStorage.hooks.get(data.correlationId, { resolveData: 'all' });
         }
 
+        if (data.eventType === 'hook_received') {
+          const event = await appendEventToActiveRun(
+            runId,
+            { ...data, specVersion } as AnyEventRequest,
+            params
+          );
+          return { event: filterEventData(event, resolveData) };
+        }
+
         let run: WorkflowRun | undefined;
         let step: Step | undefined;
         let hook: Hook | undefined;
@@ -1157,17 +1371,11 @@ export function createStorage(config: StorageConfig): Storage {
             run.specVersion = currentRun.specVersion;
             break;
           case 'attr_set': {
-            validateAttributeChanges(data.eventData.changes, {
-              existingKeys: Object.keys(currentRun.attributes),
-              allowReservedAttributes:
-                data.eventData.allowReservedAttributes === true,
-            });
-            run = await legacyStorage.runs.update(runId, {
-              attributes: applyAttributeChanges(
-                currentRun.attributes,
-                data.eventData.changes
-              ),
-            });
+            run = await legacyStorage.runs.updateAttributes(
+              runId,
+              data.eventData.changes,
+              data.eventData.allowReservedAttributes === true
+            );
             run.specVersion = currentRun.specVersion;
             break;
           }
@@ -1346,12 +1554,27 @@ export function createStorage(config: StorageConfig): Storage {
                 error instanceof WorkflowAPIError &&
                 (error as { status?: number }).status === 409
               ) {
+                const conflictingHook = await legacyStorage.hooks.getByToken(
+                  data.eventData.token,
+                  { resolveData: 'none' }
+                );
+                if (
+                  conflictingHook.runId === runId &&
+                  conflictingHook.hookId === hookId
+                ) {
+                  throw new EntityConflictError(
+                    `Hook '${hookId}' already exists`
+                  );
+                }
                 const conflictEvent = await appendEvent(
                   runId,
                   {
                     eventType: 'hook_conflict',
                     correlationId: hookId,
-                    eventData: { token: data.eventData.token },
+                    eventData: {
+                      token: data.eventData.token,
+                      conflictingRunId: conflictingHook.runId,
+                    },
                     specVersion,
                   } as unknown as AnyEventRequest,
                   params
@@ -1373,8 +1596,6 @@ export function createStorage(config: StorageConfig): Storage {
             hook = await legacyStorage.hooks.dispose(hookId, params);
             break;
           }
-          case 'hook_received':
-            break;
           case 'wait_created': {
             const waitCorrelationId = data.correlationId;
             if (!waitCorrelationId) {
