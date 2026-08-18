@@ -61,7 +61,6 @@ export function createWorld(config: TursoWorldConfig = {}): World {
     capabilities: {
       hookRetention: { active: true },
     },
-    processExitTriggersQueueRedelivery: false,
     ...storage,
     ...streamer,
     getDeploymentId: queue.getDeploymentId,

@@ -269,7 +269,7 @@ fi
 
 if [[ -z "$UPSTREAM_REF" ]]; then
   if [[ "$WORLD_ID" == "turso" ]]; then
-    UPSTREAM_REF="workflow@5.0.0-beta.40"
+    UPSTREAM_REF="workflow@5.0.0-beta.42"
   else
     UPSTREAM_REF="workflow@4.1.0-beta.54"
   fi

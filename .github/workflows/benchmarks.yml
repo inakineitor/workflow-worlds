@@ -396,8 +396,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Select the Workflow v5 benchmark runtime
-        run: pnpm --filter @workflow-worlds/workbench add workflow@5.0.0-beta.40 --save-exact
+      - name: Select the Workflow v6 benchmark runtime
+        run: pnpm --filter @workflow-worlds/workbench add workflow@5.0.0-beta.42 --save-exact
 
       - name: Setup Turso database
         run: pnpm --filter @workflow-worlds/workbench exec workflow-turso-setup

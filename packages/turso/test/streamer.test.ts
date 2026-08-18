@@ -14,7 +14,7 @@ async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
   return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
-describe('Workflow v5 streams', () => {
+describe('Workflow v6 streams', () => {
   it('isolates equal stream names by run and exposes chunk metadata', async () => {
     const { streamer } = await createStreamer();
     await streamer.streams.writeMulti?.('run-stream-a', 'output', [

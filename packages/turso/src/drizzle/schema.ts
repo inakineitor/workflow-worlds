@@ -15,6 +15,7 @@ import {
   customType,
   primaryKey,
 } from 'drizzle-orm/sqlite-core';
+import { sql } from 'drizzle-orm';
 import { encode, decode } from 'cbor-x';
 
 /**
@@ -121,7 +122,7 @@ export const steps = sqliteTable(
 export const events = sqliteTable(
   'workflow_events',
   {
-    eventId: text('event_id').primaryKey(),
+    eventId: text('event_id').notNull(),
     runId: text('run_id').notNull(),
     stepId: text('step_id'),
     eventType: text('type').notNull(),
@@ -135,10 +136,35 @@ export const events = sqliteTable(
     resumeId: text('resume_id'),
   },
   (table) => [
+    primaryKey({ columns: [table.runId, table.eventId] }),
     index('idx_events_run').on(table.runId, table.eventId),
     index('idx_events_correlation').on(table.correlationId, table.eventId),
+    index('idx_events_run_correlation').on(
+      table.runId,
+      table.correlationId,
+      table.eventId
+    ),
+    uniqueIndex('idx_events_child_entity_unique')
+      .on(table.runId, table.eventType, table.correlationId)
+      .where(
+        sql`${table.eventType} IN ('step_created', 'hook_created', 'wait_created')`
+      ),
+    uniqueIndex('idx_events_resume_id_unique')
+      .on(table.runId, table.resumeId)
+      .where(sql`${table.resumeId} IS NOT NULL`),
   ]
 );
+
+/**
+ * Marks runs that use Workflow spec v6 slot-numbered event IDs.
+ *
+ * This table deliberately stores no counter. The event insert derives the next
+ * position from the committed log, so a rejected write cannot leave a hole.
+ * Markerless runs predate slots and keep using monotonic ULIDs.
+ */
+export const eventSlots = sqliteTable('workflow_event_slots', {
+  runId: text('run_id').primaryKey(),
+});
 
 // =============================================================================
 // Workflow Hooks
@@ -245,7 +271,7 @@ export const streamRuns = sqliteTable(
 );
 
 // =============================================================================
-// Workflow v5 Streams
+// Workflow Event-Sourced Streams
 // =============================================================================
 
 export const streams = sqliteTable(

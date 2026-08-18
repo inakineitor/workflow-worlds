@@ -2,7 +2,7 @@
  * Turso Storage Implementation
  *
  * Implements Storage using Turso/libSQL with an internal mutator layer, then
- * exposes the Workflow v5 event-sourced public Storage surface.
+ * exposes the Workflow v6 event-sourced public Storage surface.
  */
 
 import type { Client } from '@libsql/client';
@@ -34,10 +34,16 @@ import type {
 } from '@workflow/world';
 import {
   applyAttributeChanges,
+  EVENT_ID_PREFIX,
+  eventIdToSlot,
+  FIRST_EVENT_SLOT,
   isChildEntityCreationEvent,
   isLegacySpecVersion,
+  MAX_EVENT_SLOT,
   requiresNewerWorld,
+  slotToEventId,
   SPEC_VERSION_CURRENT,
+  SPEC_VERSION_SUPPORTS_SLOT_IDENTITY,
   stripEventDataRefs,
   validateAttributeChanges,
 } from '@workflow/world';
@@ -60,6 +66,9 @@ import { monotonicFactory } from 'ulid';
 import * as schema from './drizzle/schema.js';
 
 const generateUlid = monotonicFactory();
+const eventSlotPrintfFormat = `%0${
+  slotToEventId(FIRST_EVENT_SLOT).length - EVENT_ID_PREFIX.length
+}d`;
 
 type UpdateWorkflowRunRequest = {
   status?: WorkflowRun['status'];
@@ -199,11 +208,11 @@ function toWorkflowRun(row: RunRow, specVersion?: number): WorkflowRun {
     workflowName: row.workflowName,
     specVersion,
     status: row.status as WorkflowRun['status'],
-    input: row.input,
-    output: row.output,
+    input: row.input ?? undefined,
+    output: row.output ?? undefined,
     error: row.error ?? undefined,
     errorCode: row.errorCode ?? undefined,
-    executionContext: row.executionContext,
+    executionContext: row.executionContext ?? undefined,
     attributes: row.attributes ?? {},
     encryptionPublicKey: row.encryptionPublicKey ?? undefined,
     expiredAt: toDate(row.expiredAt),
@@ -221,8 +230,8 @@ function toStep(row: StepRow, specVersion?: number): Step {
     stepName: row.stepName ?? '',
     specVersion,
     status: row.status as Step['status'],
-    input: row.input,
-    output: row.output,
+    input: row.input ?? undefined,
+    output: row.output ?? undefined,
     error: (row.error ?? undefined) as Step['error'],
     attempt: row.attempt ?? 0,
     retryAfter: toDate(row.retryAfter),
@@ -303,15 +312,6 @@ export function createStorage(config: StorageConfig): Storage {
     );
   }
 
-  async function setRunSpecVersion(runId: string, specVersion: number): Promise<void> {
-    await config.client.execute({
-      sql: `INSERT INTO workflow_run_versions (run_id, spec_version)
-            VALUES (?, ?)
-            ON CONFLICT(run_id) DO UPDATE SET spec_version = excluded.spec_version`,
-      args: [runId, specVersion],
-    });
-  }
-
   async function getRunSpecVersion(runId: string): Promise<number | undefined> {
     const result = await config.client.execute({
       sql: 'SELECT spec_version FROM workflow_run_versions WHERE run_id = ?',
@@ -322,6 +322,91 @@ export function createStorage(config: StorageConfig): Storage {
       return undefined;
     }
     return Number(row.spec_version);
+  }
+
+  /**
+   * Allocates and occupies an event ID in one atomic write statement.
+   * Slot-numbered runs derive the next position from the committed event log.
+   * Markerless runs retain the pre-v6 monotonic ULID scheme.
+   */
+  async function insertEvent(
+    runId: string,
+    data: AnyEventRequest,
+    params?: CreateEventParams,
+    activeRunOnly = false
+  ): Promise<Event | undefined> {
+    const legacyEventId = `evnt_${generateUlid()}`;
+    const now = new Date();
+    const activeRunClause = activeRunOnly
+      ? `JOIN workflow_runs AS active_run
+           ON active_run.run_id = ?
+          AND active_run.status NOT IN ('completed', 'failed', 'cancelled')`
+      : '';
+    const result = await config.client.execute({
+      sql: `INSERT INTO workflow_events (
+                event_id, run_id, type, correlation_id, payload,
+                created_at, occurred_at, resume_id
+              )
+              SELECT
+                CASE
+                  WHEN allocation.uses_slots
+                    AND allocation.last_slot < ?
+                    THEN ? || printf(?, allocation.last_slot + 1)
+                  WHEN allocation.uses_slots THEN NULL
+                  ELSE ?
+                END,
+                ?, ?, ?, ?, ?, ?, ?
+              FROM (
+                SELECT
+                  EXISTS (
+                    SELECT 1 FROM workflow_event_slots WHERE run_id = ?
+                  ) AS uses_slots,
+                  COALESCE((
+                    SELECT CAST(substr(event_id, ?) AS INTEGER)
+                    FROM workflow_events
+                    WHERE run_id = ?
+                    ORDER BY event_id DESC
+                    LIMIT 1
+                  ), ?) AS last_slot
+              ) AS allocation
+              ${activeRunClause}
+              RETURNING event_id`,
+      args: [
+        MAX_EVENT_SLOT,
+        EVENT_ID_PREFIX,
+        eventSlotPrintfFormat,
+        legacyEventId,
+        runId,
+        data.eventType,
+        data.correlationId ?? null,
+        Buffer.from(encode(data)),
+        now.toISOString(),
+        toIsoString(params?.occurredAt),
+        params?.resumeId ?? null,
+        runId,
+        EVENT_ID_PREFIX.length + 1,
+        runId,
+        FIRST_EVENT_SLOT - 1,
+        ...(activeRunOnly ? [runId] : []),
+      ],
+    });
+
+    const eventId = result.rows[0]?.event_id;
+    if (typeof eventId !== 'string') {
+      return undefined;
+    }
+
+    return filterEventData(
+      {
+        ...data,
+        runId,
+        eventId,
+        createdAt: now,
+        occurredAt: params?.occurredAt,
+        resumeId: params?.resumeId,
+      } as Event,
+      params?.resolveData
+    );
   }
 
   const legacyStorage: LegacyStorage = {
@@ -337,22 +422,51 @@ export function createStorage(config: StorageConfig): Storage {
         const now = new Date();
         const nowStr = now.toISOString();
 
-        await db.insert(schema.runs).values({
-          runId,
-          deploymentId: data.deploymentId,
-          workflowName: data.workflowName,
-          status: 'pending',
-          input: data.input,
-          executionContext: data.executionContext as Record<string, unknown>,
-          attributes: data.attributes ?? {},
-          encryptionPublicKey: data.encryptionPublicKey,
-          createdAt: nowStr,
-          updatedAt: nowStr,
-        });
-
-        if (data.specVersion !== undefined) {
-          await setRunSpecVersion(runId, data.specVersion);
-        }
+        await config.client.batch(
+          [
+            {
+              sql: `INSERT INTO workflow_runs (
+                      run_id, deployment_id, workflow_name, status, input,
+                      execution_context, attributes, encryption_public_key,
+                      created_at, updated_at
+                    ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+              args: [
+                runId,
+                data.deploymentId,
+                data.workflowName,
+                data.input === undefined
+                  ? null
+                  : Buffer.from(encode(data.input)),
+                data.executionContext === undefined
+                  ? null
+                  : Buffer.from(encode(data.executionContext)),
+                Buffer.from(encode(data.attributes ?? {})),
+                data.encryptionPublicKey ?? null,
+                nowStr,
+                nowStr,
+              ],
+            },
+            ...(data.specVersion === undefined
+              ? []
+              : [
+                  {
+                    sql: `INSERT INTO workflow_run_versions (run_id, spec_version)
+                          VALUES (?, ?)`,
+                    args: [runId, data.specVersion],
+                  },
+                ]),
+            ...(data.specVersion !== undefined &&
+            data.specVersion >= SPEC_VERSION_SUPPORTS_SLOT_IDENTITY
+              ? [
+                  {
+                    sql: `INSERT INTO workflow_event_slots (run_id) VALUES (?)`,
+                    args: [runId],
+                  },
+                ]
+              : []),
+          ],
+          'write'
+        );
 
         return {
           runId,
@@ -685,31 +799,14 @@ export function createStorage(config: StorageConfig): Storage {
         data: AnyEventRequest,
         params?: CreateEventParams
       ): Promise<Event> {
-        const eventId = `evnt_${generateUlid()}`;
-        const now = new Date();
-        const nowStr = now.toISOString();
-
-        await db.insert(schema.events).values({
-          eventId,
-          runId,
-          eventType: data.eventType,
-          correlationId: data.correlationId ?? null,
-          payload: data as Record<string, unknown>,
-          createdAt: nowStr,
-          occurredAt: toIsoString(params?.occurredAt),
-          resumeId: params?.resumeId ?? null,
-        });
-
-        const event: Event = {
-          ...data,
-          runId,
-          eventId,
-          createdAt: now,
-          occurredAt: params?.occurredAt,
-          resumeId: params?.resumeId,
-        } as Event;
-
-        return filterEventData(event, params?.resolveData);
+        const event = await insertEvent(runId, data, params);
+        if (!event) {
+          throw new WorkflowAPIError(
+            `Event '${data.eventType}' could not be created for run '${runId}'`,
+            { status: 500 }
+          );
+        }
+        return event;
       },
 
       async get(
@@ -996,53 +1093,61 @@ export function createStorage(config: StorageConfig): Storage {
     params?: CreateEventParams
   ) => Promise<Event>;
 
+  async function attachSkippedEvents(
+    result: EventResult,
+    params?: CreateEventParams
+  ): Promise<EventResult> {
+    const event = result.event;
+    const eventCount = params?.eventCount;
+    if (!event || eventCount === undefined) {
+      return result;
+    }
+
+    const committedSlot = eventIdToSlot(event.eventId);
+    if (
+      committedSlot === null ||
+      eventCount < FIRST_EVENT_SLOT ||
+      committedSlot <= eventCount + 1
+    ) {
+      return result;
+    }
+
+    const rows = await db
+      .select()
+      .from(schema.events)
+      .where(
+        and(
+          eq(schema.events.runId, event.runId),
+          gt(schema.events.eventId, slotToEventId(eventCount)),
+          lt(schema.events.eventId, event.eventId)
+        )
+      )
+      .orderBy(schema.events.eventId);
+    const events = rows.map((row) =>
+      filterEventData(toEvent(row), params?.resolveData)
+    );
+
+    return {
+      ...result,
+      events,
+      cursor: null,
+      hasMore: events.length < committedSlot - eventCount - 1,
+    };
+  }
+
   async function appendEventToActiveRun(
     runId: string,
     data: AnyEventRequest,
     params?: CreateEventParams
   ): Promise<Event> {
-    const eventId = `evnt_${generateUlid()}`;
-    const now = new Date();
-    const result = await config.client.execute({
-      sql: `INSERT INTO workflow_events (
-              event_id, run_id, type, correlation_id, payload,
-              created_at, occurred_at, resume_id
-            )
-            SELECT ?, run_id, ?, ?, ?, ?, ?, ?
-            FROM workflow_runs
-            WHERE run_id = ?
-              AND status NOT IN ('completed', 'failed', 'cancelled')
-            RETURNING event_id`,
-      args: [
-        eventId,
-        data.eventType,
-        data.correlationId ?? null,
-        Buffer.from(encode(data)),
-        now.toISOString(),
-        toIsoString(params?.occurredAt),
-        params?.resumeId ?? null,
-        runId,
-      ],
-    });
-
-    if (result.rows.length === 0) {
+    const event = await insertEvent(runId, data, params, true);
+    if (!event) {
       const run = await legacyStorage.runs.get(runId, { resolveData: 'none' });
       throw new RunExpiredError(
         `Workflow run "${runId}" is already in terminal state "${run.status}"`
       );
     }
-
-    return filterEventData(
-      {
-        ...data,
-        runId,
-        eventId,
-        createdAt: now,
-        occurredAt: params?.occurredAt,
-        resumeId: params?.resumeId,
-      } as Event,
-      params?.resolveData
-    );
+    return event;
   }
 
   async function handleLegacyEvent(
@@ -1133,10 +1238,13 @@ export function createStorage(config: StorageConfig): Storage {
             params
           );
 
-          return {
-            event: filterEventData(event, resolveData),
-            run: filterRunData(run, resolveData),
-          };
+          return attachSkippedEvents(
+            {
+              event: filterEventData(event, resolveData),
+              run: filterRunData(run, resolveData),
+            },
+            params
+          );
         }
 
         if (!runId) {
@@ -1229,10 +1337,13 @@ export function createStorage(config: StorageConfig): Storage {
               { ...data, specVersion } as AnyEventRequest,
               params
             );
-            return {
-              event: filterEventData(idempotentEvent, resolveData),
-              run: filterRunData(currentRun, resolveData),
-            };
+            return attachSkippedEvents(
+              {
+                event: filterEventData(idempotentEvent, resolveData),
+                run: filterRunData(currentRun, resolveData),
+              },
+              params
+            );
           }
 
           if (runTerminalEvents.has(data.eventType)) {
@@ -1330,7 +1441,10 @@ export function createStorage(config: StorageConfig): Storage {
             { ...data, specVersion } as AnyEventRequest,
             params
           );
-          return { event: filterEventData(event, resolveData) };
+          return attachSkippedEvents(
+            { event: filterEventData(event, resolveData) },
+            params
+          );
         }
 
         let run: WorkflowRun | undefined;
@@ -1579,7 +1693,10 @@ export function createStorage(config: StorageConfig): Storage {
                   } as unknown as AnyEventRequest,
                   params
                 );
-                return { event: filterEventData(conflictEvent, resolveData) };
+                return attachSkippedEvents(
+                  { event: filterEventData(conflictEvent, resolveData) },
+                  params
+                );
               }
               throw error;
             }
@@ -1703,14 +1820,17 @@ export function createStorage(config: StorageConfig): Storage {
           params
         );
 
-        return {
-          event: filterEventData(event, resolveData),
-          run: run ? filterRunData(run, resolveData) : undefined,
-          step: step ? filterStepData(step, resolveData) : undefined,
-          hook: hook ? filterHookData(hook, resolveData) : undefined,
-          wait,
-          ...(stepCreatedLazily ? { stepCreated: true } : {}),
-        };
+        return attachSkippedEvents(
+          {
+            event: filterEventData(event, resolveData),
+            run: run ? filterRunData(run, resolveData) : undefined,
+            step: step ? filterStepData(step, resolveData) : undefined,
+            hook: hook ? filterHookData(hook, resolveData) : undefined,
+            wait,
+            ...(stepCreatedLazily ? { stepCreated: true } : {}),
+          },
+          params
+        );
       },
 
       async list(params: any) {

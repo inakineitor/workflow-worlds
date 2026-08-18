@@ -21,9 +21,9 @@ on:
         options: ['all', 'turso', 'mongodb', 'redis']
         default: 'all'
       upstream-ref:
-        description: 'vercel/workflow v5 git ref for Turso'
+        description: 'vercel/workflow v6 git ref for Turso'
         type: string
-        default: 'workflow@5.0.0-beta.40'
+        default: 'workflow@5.0.0-beta.42'
 
 permissions:
   contents: read
@@ -35,7 +35,7 @@ concurrency:
 
 env:
   LEGACY_UPSTREAM_REF: 'workflow@4.1.0-beta.54'
-  TURSO_UPSTREAM_REF: ${{ inputs.upstream-ref || 'workflow@5.0.0-beta.40' }}
+  TURSO_UPSTREAM_REF: ${{ inputs.upstream-ref || 'workflow@5.0.0-beta.42' }}
   UPSTREAM_RUST_TOOLCHAIN: '1.95.0'
   APP_NAME: nextjs-turbopack
 
@@ -136,7 +136,7 @@ jobs:
   # ============================================================
 
   build_turso:
-    name: Build Turso v5
+    name: Build Turso v6
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -177,10 +177,10 @@ jobs:
           path: .tarballs-turso
           key: ${{ steps.tarball-meta.outputs.cache-key }}
 
-      - name: Clone Workflow v5
+      - name: Clone Workflow v6
         run: git clone --depth=1 --branch ${{ env.TURSO_UPSTREAM_REF }} https://github.com/vercel/workflow.git .upstream-turso
 
-      - name: Workflow v5 metadata
+      - name: Workflow v6 metadata
         id: upstream-meta
         run: |
           SHA=$(git -C .upstream-turso rev-parse HEAD)
@@ -188,14 +188,14 @@ jobs:
           PNPM_VERSION=$(node -e "const pm = require('./.upstream-turso/package.json').packageManager || ''; console.log(pm.split('@')[1] || '10.15.1')")
           echo "pnpm-version=${PNPM_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Restore Workflow v5 cache
+      - name: Restore Workflow v6 cache
         id: upstream-cache
         uses: actions/cache@v4
         with:
           path: .upstream-turso
           key: ${{ steps.upstream-meta.outputs.cache-key }}
 
-      - name: Install and build Workflow v5
+      - name: Install and build Workflow v6
         if: steps.upstream-cache.outputs.cache-hit != 'true'
         working-directory: .upstream-turso
         run: |
@@ -204,7 +204,7 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm turbo run build --filter='!./workbench/*'
 
-      - name: Trim Workflow v5 cache
+      - name: Trim Workflow v6 cache
         if: steps.upstream-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf .upstream-turso/.git
