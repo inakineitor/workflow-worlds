@@ -1,5 +1,17 @@
 # @workflow-worlds/turso
 
+## 0.3.0
+
+### Minor Changes
+
+- [`e98a7be`](https://github.com/mizzle-dev/workflow-worlds/commit/e98a7be8a02c462147d046f2a4f4ddc24e985400) Thanks [@inakineitor](https://github.com/inakineitor)! - Port the Turso World to Workflow v5, including durable queue recovery, run-isolated streams, current event materialization, waits, attributes, automatic migrations, and deterministic resource cleanup.
+
+- [`dc6905e`](https://github.com/mizzle-dev/workflow-worlds/commit/dc6905ef5da4a50ff91e70814c7f13db112a0e7c) Thanks [@inakineitor](https://github.com/inakineitor)! - Upgrade the Turso World to Workflow spec v6 with dense per-run event slot IDs, bump-and-report handling for stale writers, and a no-backfill migration that preserves existing run identity schemes.
+
+### Patch Changes
+
+- [#32](https://github.com/mizzle-dev/workflow-worlds/pull/32) [`483d576`](https://github.com/mizzle-dev/workflow-worlds/commit/483d5763b52eca176554566d84f0b5d233863b73) Thanks [@dustintownsend](https://github.com/dustintownsend)! - Configure runtime local SQLite connections with `PRAGMA journal_mode = WAL` and `PRAGMA busy_timeout = 5000` to reduce transient `SQLITE_BUSY` lock failures under e2e workloads.
+
 ## 0.2.2
 
 ### Patch Changes
