@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { createStorage } from './setup.js';
 
-describe('Workflow v5 storage', () => {
+describe('Workflow v6 storage', () => {
   it('materializes attributes, waits, lazy steps, and hook metadata', async () => {
     const { storage } = await createStorage();
     const runId = 'wrun_01KZSTORAGEV500000000000001';
     const created = await storage.events.create(runId, {
       eventType: 'run_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       eventData: {
-        deploymentId: 'deployment-v5',
+        deploymentId: 'deployment-v6',
         workflowName: 'workflow//test//storage',
         input: new Uint8Array([1, 2, 3]),
         attributes: { tenant: 'marcus' },
@@ -19,14 +20,14 @@ describe('Workflow v5 storage', () => {
 
     expect(created.run).toMatchObject({
       runId,
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       attributes: { tenant: 'marcus' },
       encryptionPublicKey: 'public-key',
     });
 
     const attributed = await storage.events.create(runId, {
       eventType: 'attr_set',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'attr-1',
       eventData: {
         changes: [
@@ -43,21 +44,21 @@ describe('Workflow v5 storage', () => {
 
     const wait = await storage.events.create(runId, {
       eventType: 'wait_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'wait-1',
       eventData: { resumeAt: new Date('2030-01-01T00:00:00.000Z') },
     });
-    expect(wait.wait).toMatchObject({ status: 'waiting', specVersion: 5 });
+    expect(wait.wait).toMatchObject({ status: 'waiting', specVersion: SPEC_VERSION_CURRENT });
     const completedWait = await storage.events.create(runId, {
       eventType: 'wait_completed',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'wait-1',
     });
     expect(completedWait.wait?.status).toBe('completed');
 
     const lazyStep = await storage.events.create(runId, {
       eventType: 'step_started',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'step-1',
       eventData: {
         stepName: 'step//test//lazy',
@@ -73,10 +74,10 @@ describe('Workflow v5 storage', () => {
 
     const hook = await storage.events.create(runId, {
       eventType: 'hook_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'hook-1',
       eventData: {
-        token: 'token-storage-v5',
+        token: 'token-storage-v6',
         metadata: new Uint8Array([6]),
         isWebhook: true,
         isSystem: true,
@@ -86,7 +87,7 @@ describe('Workflow v5 storage', () => {
       isWebhook: true,
       isSystem: true,
       resumeContext: {
-        deploymentId: 'deployment-v5',
+        deploymentId: 'deployment-v6',
         workflowName: 'workflow//test//storage',
       },
     });
@@ -98,16 +99,16 @@ describe('Workflow v5 storage', () => {
       const runId = `wrun_01KZCORRELATION00000000000${suffix}`;
       await storage.events.create(runId, {
         eventType: 'run_created',
-        specVersion: 5,
+        specVersion: SPEC_VERSION_CURRENT,
         eventData: {
-          deploymentId: 'deployment-v5',
+          deploymentId: 'deployment-v6',
           workflowName: 'workflow//test//correlation',
           input: new Uint8Array(),
         },
       });
       await storage.events.create(runId, {
         eventType: 'step_created',
-        specVersion: 5,
+        specVersion: SPEC_VERSION_CURRENT,
         correlationId: 'step-shared',
         eventData: {
           stepName: 'step//test//shared',
@@ -133,16 +134,16 @@ describe('Workflow v5 storage', () => {
     const runId = 'wrun_01KZEVENTCURSOR000000000001';
     await storage.events.create(runId, {
       eventType: 'run_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       eventData: {
-        deploymentId: 'deployment-v5',
+        deploymentId: 'deployment-v6',
         workflowName: 'workflow//test//cursor',
         input: new Uint8Array(),
       },
     });
     await storage.events.create(runId, {
       eventType: 'attr_set',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'attr-cursor',
       eventData: {
         changes: [{ key: 'phase', value: 'first' }],
@@ -159,7 +160,7 @@ describe('Workflow v5 storage', () => {
 
     await storage.events.create(runId, {
       eventType: 'attr_set',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'attr-cursor-next',
       eventData: {
         changes: [{ key: 'phase', value: 'second' }],
@@ -180,9 +181,9 @@ describe('Workflow v5 storage', () => {
     const runId = 'wrun_01KZATTRCONCURRENT0000000001';
     await storage.events.create(runId, {
       eventType: 'run_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       eventData: {
-        deploymentId: 'deployment-v5',
+        deploymentId: 'deployment-v6',
         workflowName: 'workflow//test//attributes',
         input: new Uint8Array(),
       },
@@ -192,7 +193,7 @@ describe('Workflow v5 storage', () => {
       ['a', 'b', 'c'].map((key, index) =>
         storage.events.create(runId, {
           eventType: 'attr_set',
-          specVersion: 5,
+          specVersion: SPEC_VERSION_CURRENT,
           correlationId: `attr-concurrent-${key}`,
           eventData: {
             changes: [{ key, value: String(index + 1) }],
@@ -214,9 +215,9 @@ describe('Workflow v5 storage', () => {
     for (const runId of [ownerRunId, contenderRunId]) {
       await storage.events.create(runId, {
         eventType: 'run_created',
-        specVersion: 5,
+        specVersion: SPEC_VERSION_CURRENT,
         eventData: {
-          deploymentId: 'deployment-v5',
+          deploymentId: 'deployment-v6',
           workflowName: 'workflow//test//hooks',
           input: new Uint8Array(),
         },
@@ -224,21 +225,21 @@ describe('Workflow v5 storage', () => {
     }
     await storage.events.create(ownerRunId, {
       eventType: 'hook_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'owner-hook',
-      eventData: { token: 'token-conflict-v5', isWebhook: false },
+      eventData: { token: 'token-conflict-v6', isWebhook: false },
     });
 
     const conflict = await storage.events.create(contenderRunId, {
       eventType: 'hook_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'contender-hook',
-      eventData: { token: 'token-conflict-v5', isWebhook: false },
+      eventData: { token: 'token-conflict-v6', isWebhook: false },
     });
     expect(conflict.event).toMatchObject({
       eventType: 'hook_conflict',
       eventData: {
-        token: 'token-conflict-v5',
+        token: 'token-conflict-v6',
         conflictingRunId: ownerRunId,
       },
     });
@@ -249,47 +250,47 @@ describe('Workflow v5 storage', () => {
     const runId = 'wrun_01KZHOOKRETENTION00000000001';
     await storage.events.create(runId, {
       eventType: 'run_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       eventData: {
-        deploymentId: 'deployment-v5',
+        deploymentId: 'deployment-v6',
         workflowName: 'workflow//test//retention',
         input: new Uint8Array(),
       },
     });
     await storage.events.create(runId, {
       eventType: 'hook_created',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       correlationId: 'retained-hook',
       eventData: {
-        token: 'token-retained-v5',
+        token: 'token-retained-v6',
         isWebhook: false,
         tokenRetentionUntil: new Date(Date.now() + 60_000),
       },
     });
     await storage.events.create(runId, {
       eventType: 'run_completed',
-      specVersion: 5,
+      specVersion: SPEC_VERSION_CURRENT,
       eventData: { output: new Uint8Array() },
     });
 
-    await expect(storage.hooks.getByToken('token-retained-v5')).resolves.toMatchObject({
+    await expect(storage.hooks.getByToken('token-retained-v6')).resolves.toMatchObject({
       runId,
       hookId: 'retained-hook',
     });
     await expect(
       storage.events.create(runId, {
         eventType: 'hook_received',
-        specVersion: 5,
+        specVersion: SPEC_VERSION_CURRENT,
         correlationId: 'retained-hook',
         eventData: {
-          token: 'token-retained-v5',
+          token: 'token-retained-v6',
           payload: new Uint8Array(),
         },
       })
     ).rejects.toMatchObject({ name: 'RunExpiredError' });
-    await expect(storage.hooks.getByToken('token-missing-v5')).rejects.toMatchObject({
+    await expect(storage.hooks.getByToken('token-missing-v6')).rejects.toMatchObject({
       name: 'HookNotFoundError',
-      token: 'token-missing-v5',
+      token: 'token-missing-v6',
     });
   });
 });

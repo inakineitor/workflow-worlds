@@ -47,16 +47,18 @@ The runtime imports and calls this function via `WORKFLOW_TARGET_WORLD`.
 
 ### ID Generation
 
-Use monotonic ULIDs with prefixes:
+Use monotonic ULIDs with prefixes for globally unique entities and pre-v6 event logs:
 ```typescript
 import { monotonicFactory } from 'ulid';
 const generateUlid = monotonicFactory();
 
 const runId = `wrun_${generateUlid()}`;
 const stepId = `step_${generateUlid()}`;
-const eventId = `evnt_${generateUlid()}`;
 const hookId = `hook_${generateUlid()}`;
+const legacyEventId = `evnt_${generateUlid()}`;
 ```
+
+Workflow spec v6 event IDs are the exception. They are dense, 1-based positions scoped to a run and must be formatted with `slotToEventId()` from `@workflow/world`. Never preallocate or persist a separate counter because rejected writes must not leave gaps.
 
 ## Critical Patterns
 

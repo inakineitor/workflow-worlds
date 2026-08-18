@@ -3,11 +3,12 @@
 [![npm version](https://img.shields.io/npm/v/@workflow-worlds/turso.svg)](https://www.npmjs.com/package/@workflow-worlds/turso)
 [![license](https://img.shields.io/npm/l/@workflow-worlds/turso.svg)](https://github.com/mizzle-dev/workflow-worlds/blob/main/LICENSE)
 
-A Turso and libSQL backed World implementation for Workflow DevKit v5.
+A Turso and libSQL backed World implementation for Workflow DevKit spec v6.
 
 ## Features
 
-- Workflow v5 event-sourced storage for runs, steps, events, hooks, waits, and attributes
+- Workflow spec v6 event-sourced storage with dense, per-run event slot IDs
+- Materialized runs, steps, hooks, waits, and attributes
 - Durable polling queue with stable message IDs, retries, delayed delivery, and stale-lease recovery
 - Run-isolated persistent streams with live reads and paginated chunk access
 - Embedded SQLite files or remote Turso databases
@@ -78,7 +79,7 @@ You can also apply migrations explicitly:
 pnpm exec workflow-turso-setup
 ```
 
-Migrations are idempotent. The Workflow v5 migration preserves existing v0.2.2 entities and converts legacy stream data into the run-isolated stream tables.
+Migrations are idempotent. The Workflow v5 migration preserves existing v0.2.2 entities and converts legacy stream data into the run-isolated stream tables. The spec v6 migration changes event identity to `(runId, eventId)` and marks newly created runs for dense slot IDs. It does not rewrite or mark existing runs, which continue using their original monotonic ULID event IDs.
 
 ## Configuration
 
